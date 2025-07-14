@@ -3,6 +3,7 @@ package exporter
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 
 	"github.com/dundee/gdu/v5/pkg/analyze"
@@ -54,12 +55,21 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
+	// Set max cores to 12 for SSD high-performance scanning (equivalent to gdu -m 12)
+	runtime.GOMAXPROCS(12)
+
+	// Create analyzer once and reuse for better performance
+	analyzer := analyze.CreateAnalyzer()
+	analyzer.SetFollowSymlinks(e.followSymlinks)
+
 	for path, level := range e.paths {
-		analyzer := analyze.CreateAnalyzer()
-		analyzer.SetFollowSymlinks(e.followSymlinks)
-		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, false)
+		// Use constGC=true for better memory management during intensive analysis
+		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
+
+		// Reset progress for next analysis
+		analyzer.ResetProgress()
 	}
 
 	log.Info("Analysis done")
