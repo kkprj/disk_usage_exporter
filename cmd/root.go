@@ -43,6 +43,11 @@ and reporting which directories consume what space.`,
 			e.SetBasicAuth(viper.GetStringMapString("basic-auth-users"))
 		}
 
+		// Configure storage and scan interval if specified
+		if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
+			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"))
+		}
+
 		if viper.GetString("mode") == "file" {
 			e.WriteToTextfile(viper.GetString("output-file"))
 			log.Info("Done - exiting.")
@@ -76,6 +81,8 @@ func init() {
 	)
 	flags.StringToString("multi-paths", map[string]string{}, "Multiple paths where to analyze disk usage, in format /path1=level1,/path2=level2,...")
 	flags.StringToString("basic-auth-users", map[string]string{}, "Basic Auth users and their passwords as bcypt hashes")
+	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
+	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
 
 	viper.BindPFlags(flags)
 }

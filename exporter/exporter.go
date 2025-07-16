@@ -61,10 +61,10 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	}
 }
 
-// SetStorageConfig sets storage path and scan interval
-func (e *Exporter) SetStorageConfig(storagePath string, scanInterval time.Duration) {
+// SetStorageConfig sets storage path and scan interval in minutes
+func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int) {
 	e.storagePath = storagePath
-	e.scanInterval = scanInterval
+	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
 }
 
 func (e *Exporter) runBackgroundScan() {
@@ -157,8 +157,8 @@ func (e *Exporter) loadFromStorage() {
 		storage := analyze.NewStorage(e.storagePath, "")
 		closeFn := storage.Open()
 		if !storage.IsOpen() {
-			log.Error("Failed to open storage")
-			e.runAnalysis()
+			log.Debugf("Failed to open storage, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v", 
+				e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
 			return
 		}
 		e.storage = storage
@@ -168,7 +168,12 @@ func (e *Exporter) loadFromStorage() {
 	for path, level := range e.paths {
 		dir, err := e.storage.GetDirForPath(path)
 		if err != nil {
-			log.Warnf("No cached data found for path: %s, error: %v", path, err)
+			log.Debugf("No cached data found for path: %s, returning empty metrics", path)
+			// Return empty metrics (0 bytes) for missing cache data
+			diskUsage.WithLabelValues(path).Set(0)
+			if level >= 1 {
+				diskUsageLevel1.WithLabelValues(path).Set(0)
+			}
 			continue
 		}
 		if dir != nil {
