@@ -48,6 +48,12 @@ and reporting which directories consume what space.`,
 			log.Warnf("Invalid log level '%s', using default 'info'", logLevel)
 			log.SetLevel(log.InfoLevel)
 		}
+		
+		// Set log formatter to include timestamps
+		log.SetFormatter(&log.TextFormatter{
+			TimestampFormat: "2006-01-02 15:04:05",
+			FullTimestamp:   true,
+		})
 
 		printHeader()
 

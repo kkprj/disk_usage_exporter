@@ -50,7 +50,8 @@ type Exporter struct {
 	scanInterval   time.Duration
 	storage        *analyze.Storage
 	storageCloseFn func()
-	analyzer       *analyze.StoredAnalyzer
+	cachedResults  map[string]fs.Item
+	lastScanTime   time.Time
 	mu             sync.RWMutex
 	stopChan       chan struct{}
 }
@@ -97,27 +98,38 @@ func (e *Exporter) performScan() {
 	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Initialize stored analyzer once if not already done
-	if e.analyzer == nil {
-		e.analyzer = analyze.CreateStoredAnalyzer(e.storagePath)
-		e.analyzer.SetFollowSymlinks(e.followSymlinks)
+	// Use regular analyzer for scanning
+	analyzer := analyze.CreateAnalyzer()
+	analyzer.SetFollowSymlinks(e.followSymlinks)
+
+	// Initialize cached results map
+	e.mu.Lock()
+	if e.cachedResults == nil {
+		e.cachedResults = make(map[string]fs.Item)
 	}
+	e.mu.Unlock()
 
 	for path := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting background scan for path: %s", path)
-		
+
 		// Use constGC=true for better memory management during intensive analysis
-		dir := e.analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-		
+
+		// Store results in memory cache
+		e.mu.Lock()
+		e.cachedResults[path] = dir
+		e.lastScanTime = time.Now()
+		e.mu.Unlock()
+
 		// Log scan completion time
 		elapsedTime := time.Since(startTime)
 		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
-		
+
 		// Reset progress for next analysis
-		e.analyzer.ResetProgress()
+		analyzer.ResetProgress()
 	}
 
 	log.Info("All background scans completed")
@@ -137,12 +149,12 @@ func (e *Exporter) runAnalysis() {
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting live analysis for path: %s", path)
-		
+
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
-		
+
 		// Log scan completion time
 		elapsedTime := time.Since(startTime)
 		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
@@ -173,22 +185,28 @@ func (e *Exporter) shouldDirBeIgnored(_, path string) bool {
 }
 
 func (e *Exporter) loadFromStorage() {
-	if e.storage == nil {
-		storage := analyze.NewStorage(e.storagePath, "")
-		closeFn := storage.Open()
-		if !storage.IsOpen() {
-			log.Debugf("Failed to open storage, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v", 
-				e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
-			return
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// Check if we have cached results
+	if e.cachedResults == nil {
+		log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
+			e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
+		// Return empty metrics for all paths
+		for path, level := range e.paths {
+			diskUsage.WithLabelValues(path).Set(0)
+			if level >= 1 {
+				diskUsageLevel1.WithLabelValues(path).Set(0)
+			}
 		}
-		e.storage = storage
-		e.storageCloseFn = closeFn
+		return
 	}
 
 	for path, level := range e.paths {
-		dir, err := e.storage.GetDirForPath(path)
-		if err != nil {
-			log.Debugf("No cached data found for path: %s, returning empty metrics", path)
+		dir, exists := e.cachedResults[path]
+		if !exists || dir == nil {
+			log.Debugf("No cached data found for path: %s, returning empty metrics - storagePath: %s, scanInterval: %v, followSymlinks: %v",
+				path, e.storagePath, e.scanInterval, e.followSymlinks)
 			// Return empty metrics (0 bytes) for missing cache data
 			diskUsage.WithLabelValues(path).Set(0)
 			if level >= 1 {
@@ -196,9 +214,7 @@ func (e *Exporter) loadFromStorage() {
 			}
 			continue
 		}
-		if dir != nil {
-			e.reportItem(dir, 0, level)
-		}
+		e.reportItem(dir, 0, level)
 	}
 }
 
@@ -277,10 +293,11 @@ func (e *Exporter) Stop() {
 	if e.storageCloseFn != nil {
 		e.storageCloseFn()
 	}
-	// Clean up analyzer resources
-	if e.analyzer != nil {
-		e.analyzer = nil
-	}
+	// Clean up cached results
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cachedResults = nil
+	e.storage = nil
 }
 
 // RunServer starts HTTP server loop
@@ -305,7 +322,7 @@ func ServeHealth(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	healthInfo := map[string]string{
-		"status": "ok",
+		"status":  "ok",
 		"version": build.BuildVersion,
 	}
 	json.NewEncoder(w).Encode(healthInfo)
@@ -315,12 +332,12 @@ func ServeHealth(w http.ResponseWriter, req *http.Request) {
 func ServeVersion(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	versionInfo := map[string]string{
-		"version":    build.BuildVersion,
-		"buildDate":  build.BuildDate,
-		"commitSha":  build.BuildCommitSha,
-		"goVersion":  runtime.Version(),
-		"goos":       runtime.GOOS,
-		"goarch":     runtime.GOARCH,
+		"version":   build.BuildVersion,
+		"buildDate": build.BuildDate,
+		"commitSha": build.BuildCommitSha,
+		"goVersion": runtime.Version(),
+		"goos":      runtime.GOOS,
+		"goarch":    runtime.GOARCH,
 	}
 	json.NewEncoder(w).Encode(versionInfo)
 }

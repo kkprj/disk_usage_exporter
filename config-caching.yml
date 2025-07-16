@@ -2,9 +2,10 @@
 # This configuration enables background caching for better performance
 
 # Basic configuration
-analyzed-path: "/mnt/meta-test"
+# analyzed-path: "/mnt/meta-test"
+analyzed-path: "/home"
 bind-address: "0.0.0.0:9996"
-dir-level: 2
+dir-level: 1
 mode: "http"
 follow-symlinks: false
 
