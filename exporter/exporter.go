@@ -101,16 +101,23 @@ func (e *Exporter) performScan() {
 	analyzer.SetFollowSymlinks(e.followSymlinks)
 
 	for path := range e.paths {
+		// Track scan time for each path
+		startTime := time.Now()
+		log.Infof("Starting background scan for path: %s", path)
+		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-		// Note: metrics will be read from storage during ServeHTTP
-
+		
+		// Log scan completion time
+		elapsedTime := time.Since(startTime)
+		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
+		
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
 	}
 
-	log.Info("Background scan completed")
+	log.Info("All background scans completed")
 }
 
 func (e *Exporter) runAnalysis() {
@@ -124,16 +131,24 @@ func (e *Exporter) runAnalysis() {
 	analyzer.SetFollowSymlinks(e.followSymlinks)
 
 	for path, level := range e.paths {
+		// Track scan time for each path
+		startTime := time.Now()
+		log.Infof("Starting live analysis for path: %s", path)
+		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
+		
+		// Log scan completion time
+		elapsedTime := time.Since(startTime)
+		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
 
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
 	}
 
-	log.Info("Analysis done")
+	log.Info("All live analysis completed")
 }
 
 // SetIgnoreDirPaths sets paths to ignore
