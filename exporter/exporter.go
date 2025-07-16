@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"runtime"
 	"runtime/debug"
+	"sync"
+	"time"
 
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/fs"
@@ -42,6 +44,12 @@ type Exporter struct {
 	ignoreDirPaths map[string]struct{}
 	followSymlinks bool
 	basicAuth      map[string]string
+	storagePath    string
+	scanInterval   time.Duration
+	storage        *analyze.Storage
+	storageCloseFn func()
+	mu             sync.RWMutex
+	stopChan       chan struct{}
 }
 
 // NewExporter creates new Exporter
@@ -49,7 +57,58 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	return &Exporter{
 		followSymlinks: followSymlinks,
 		paths:          paths,
+		stopChan:       make(chan struct{}),
 	}
+}
+
+// SetStorageConfig sets storage path and scan interval
+func (e *Exporter) SetStorageConfig(storagePath string, scanInterval time.Duration) {
+	e.storagePath = storagePath
+	e.scanInterval = scanInterval
+}
+
+func (e *Exporter) runBackgroundScan() {
+	if e.storagePath == "" || e.scanInterval == 0 {
+		return
+	}
+
+	ticker := time.NewTicker(e.scanInterval)
+	defer ticker.Stop()
+
+	// Run initial scan immediately
+	e.performScan()
+
+	for {
+		select {
+		case <-ticker.C:
+			e.performScan()
+		case <-e.stopChan:
+			return
+		}
+	}
+}
+
+func (e *Exporter) performScan() {
+	defer debug.FreeOSMemory()
+
+	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Create stored analyzer for persistent caching
+	analyzer := analyze.CreateStoredAnalyzer(e.storagePath)
+	analyzer.SetFollowSymlinks(e.followSymlinks)
+
+	for path := range e.paths {
+		// Use constGC=true for better memory management during intensive analysis
+		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir.UpdateStats(fs.HardLinkedItems{})
+		// Note: metrics will be read from storage during ServeHTTP
+
+		// Reset progress for next analysis
+		analyzer.ResetProgress()
+	}
+
+	log.Info("Background scan completed")
 }
 
 func (e *Exporter) runAnalysis() {
@@ -93,6 +152,31 @@ func (e *Exporter) shouldDirBeIgnored(_, path string) bool {
 	return ok
 }
 
+func (e *Exporter) loadFromStorage() {
+	if e.storage == nil {
+		storage := analyze.NewStorage(e.storagePath, "")
+		closeFn := storage.Open()
+		if !storage.IsOpen() {
+			log.Error("Failed to open storage")
+			e.runAnalysis()
+			return
+		}
+		e.storage = storage
+		e.storageCloseFn = closeFn
+	}
+
+	for path, level := range e.paths {
+		dir, err := e.storage.GetDirForPath(path)
+		if err != nil {
+			log.Warnf("No cached data found for path: %s, error: %v", path, err)
+			continue
+		}
+		if dir != nil {
+			e.reportItem(dir, 0, level)
+		}
+	}
+}
+
 func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
 	if level == maxLevel {
 		diskUsage.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
@@ -129,7 +213,12 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	e.runAnalysis()
+	// Use cached storage data if available, otherwise run analysis
+	if e.storagePath != "" {
+		e.loadFromStorage()
+	} else {
+		e.runAnalysis()
+	}
 	promhttp.Handler().ServeHTTP(w, req)
 }
 
@@ -149,10 +238,29 @@ func (e *Exporter) authorizeReq(w http.ResponseWriter, req *http.Request) bool {
 	return false
 }
 
+// StartBackgroundScan starts the background scanning goroutine
+func (e *Exporter) StartBackgroundScan() {
+	if e.storagePath != "" && e.scanInterval > 0 {
+		go e.runBackgroundScan()
+		log.Printf("Background scan started with interval: %v", e.scanInterval)
+	}
+}
+
+// Stop stops the background scanning
+func (e *Exporter) Stop() {
+	close(e.stopChan)
+	if e.storageCloseFn != nil {
+		e.storageCloseFn()
+	}
+}
+
 // RunServer starts HTTP server loop
 func (e *Exporter) RunServer(addr string) {
 	http.Handle("/", http.HandlerFunc(ServeIndex))
 	http.Handle("/metrics", e)
+
+	// Start background scanning if configured
+	e.StartBackgroundScan()
 
 	log.Printf("Providing metrics at http://%s/metrics", addr)
 	err := http.ListenAndServe(addr, nil)
