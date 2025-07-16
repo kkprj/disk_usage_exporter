@@ -50,6 +50,7 @@ type Exporter struct {
 	scanInterval   time.Duration
 	storage        *analyze.Storage
 	storageCloseFn func()
+	analyzer       *analyze.StoredAnalyzer
 	mu             sync.RWMutex
 	stopChan       chan struct{}
 }
@@ -96,9 +97,11 @@ func (e *Exporter) performScan() {
 	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Create stored analyzer for persistent caching
-	analyzer := analyze.CreateStoredAnalyzer(e.storagePath)
-	analyzer.SetFollowSymlinks(e.followSymlinks)
+	// Initialize stored analyzer once if not already done
+	if e.analyzer == nil {
+		e.analyzer = analyze.CreateStoredAnalyzer(e.storagePath)
+		e.analyzer.SetFollowSymlinks(e.followSymlinks)
+	}
 
 	for path := range e.paths {
 		// Track scan time for each path
@@ -106,7 +109,7 @@ func (e *Exporter) performScan() {
 		log.Infof("Starting background scan for path: %s", path)
 		
 		// Use constGC=true for better memory management during intensive analysis
-		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir := e.analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		
 		// Log scan completion time
@@ -114,7 +117,7 @@ func (e *Exporter) performScan() {
 		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
 		
 		// Reset progress for next analysis
-		analyzer.ResetProgress()
+		e.analyzer.ResetProgress()
 	}
 
 	log.Info("All background scans completed")
@@ -273,6 +276,10 @@ func (e *Exporter) Stop() {
 	close(e.stopChan)
 	if e.storageCloseFn != nil {
 		e.storageCloseFn()
+	}
+	// Clean up analyzer resources
+	if e.analyzer != nil {
+		e.analyzer = nil
 	}
 }
 
