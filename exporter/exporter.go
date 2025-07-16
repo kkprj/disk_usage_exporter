@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"runtime"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dundee/disk_usage_exporter/build"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/fs"
 	"github.com/prometheus/client_golang/prometheus"
@@ -263,6 +265,7 @@ func (e *Exporter) Stop() {
 func (e *Exporter) RunServer(addr string) {
 	http.Handle("/", http.HandlerFunc(ServeIndex))
 	http.Handle("/metrics", e)
+	http.Handle("/version", http.HandlerFunc(ServeVersion))
 
 	// Start background scanning if configured
 	e.StartBackgroundScan()
@@ -272,6 +275,20 @@ func (e *Exporter) RunServer(addr string) {
 	if err != nil {
 		log.Fatal("ListenAndServe:", err)
 	}
+}
+
+// ServeVersion serves version information
+func ServeVersion(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	versionInfo := map[string]string{
+		"version":    build.BuildVersion,
+		"buildDate":  build.BuildDate,
+		"commitSha":  build.BuildCommitSha,
+		"goVersion":  runtime.Version(),
+		"goos":       runtime.GOOS,
+		"goarch":     runtime.GOARCH,
+	}
+	json.NewEncoder(w).Encode(versionInfo)
 }
 
 // ServeIndex serves index page
@@ -288,6 +305,9 @@ func ServeIndex(w http.ResponseWriter, req *http.Request) {
 <h1>Disk Usage Prometheus Exporter</h1>
 <p>
 	<a href="/metrics">Metrics</a>
+</p>
+<p>
+	<a href="/version">Version</a>
 </p>
 <p>
 	<a href="https://github.com/dundee/disk_usage_exporter">Homepage</a>

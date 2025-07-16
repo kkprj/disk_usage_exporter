@@ -20,12 +20,26 @@ var (
 	cfgFile string
 )
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version number",
+	Run: func(cmd *cobra.Command, args []string) {
+		printVersion()
+	},
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "disk_usage_exporter",
 	Short: "Prometheus exporter for detailed disk usage info",
 	Long: `Prometheus exporter analysing disk usage of the filesystem
 and reporting which directories consume what space.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Check if version flag is set
+		if versionFlag, _ := cmd.Flags().GetBool("version"); versionFlag {
+			printVersion()
+			return
+		}
+		
 		printHeader()
 
 		paths := transformMultipaths(viper.GetStringMapString("multi-paths"))
@@ -67,7 +81,9 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize(initConfig)
+	rootCmd.AddCommand(versionCmd)
 	flags := rootCmd.PersistentFlags()
+	flags.BoolP("version", "v", false, "Print version information and exit")
 	flags.StringVarP(&cfgFile, "config", "c", "", "config file (default is $HOME/.disk_usage_exporter.yaml)")
 	flags.StringP("mode", "m", "http", "Expose method - either 'file' or 'http'")
 	flags.StringP("bind-address", "b", "0.0.0.0:9995", "Address to bind to")
@@ -111,6 +127,17 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
 	}
+}
+
+func printVersion() {
+	fmt.Printf("Disk Usage Prometheus Exporter %s\nbuild date: %s\nsha1: %s\nGo: %s\nGOOS: %s\nGOARCH: %s\n",
+		build.BuildVersion,
+		build.BuildDate,
+		build.BuildCommitSha,
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
 }
 
 func printHeader() {
