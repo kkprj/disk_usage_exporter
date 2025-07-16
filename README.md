@@ -32,6 +32,8 @@ Flags:
   -m, --mode string                       Expose method - either 'file' or 'http' (default "http")
       --multi-paths stringToString        Multiple paths where to analyze disk usage, in format /path1=level1,/path2=level2,... (default [])
   -f, --output-file string                Target file to store metrics in (default "./disk-usage-exporter.prom")
+  -t, --scan-interval-minutes int         Scan interval in minutes for background caching (0 = disabled)
+  -s, --storage-path string               Path to store cached analysis data
 ```
 
 Either one path can be specified using `--analyzed-path` and `--dir-level` flags or multiple can be set
@@ -134,6 +136,17 @@ basic-auth-users:
   prom: $2b$12$MzUQjmLxPRM9WW6OI4ZzwuZHB7ubHiiSnngJxIufgZms27nw.5ZAq
 ```
 
+`~/.disk_usage_exporter.yaml` (with background caching):
+```yaml
+analyzed-path: /mnt
+bind-address: 0.0.0.0:9995
+dir-level: 1
+mode: http
+follow-symlinks: false
+storage-path: /var/cache/gdu
+scan-interval-minutes: 30
+```
+
 ## Prometheus scrape config
 
 Disk usage analysis can be resource heavy.
@@ -173,6 +186,28 @@ basic-auth-users:
 ```
 
 The password needs to be hashed by [bcrypt](https://bcrypt-generator.com/) in both cases.
+
+## Background Caching
+
+For better performance on large filesystems, you can enable background caching by setting both `storage-path` and `scan-interval-minutes`:
+
+```yaml
+analyzed-path: /mnt
+bind-address: 0.0.0.0:9995
+dir-level: 1
+mode: http
+follow-symlinks: false
+storage-path: /var/cache/gdu
+scan-interval-minutes: 30
+```
+
+When both options are configured:
+- Background scanning runs every `scan-interval-minutes` minutes
+- Analysis results are cached in the `storage-path` directory
+- `/metrics` API responses use cached data instead of performing live analysis
+- Significantly improves response times for subsequent requests
+
+**Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
 
 
 ## Example systemd unit file
