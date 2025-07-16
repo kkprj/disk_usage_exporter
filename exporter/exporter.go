@@ -54,6 +54,7 @@ type Exporter struct {
 	lastScanTime   time.Time
 	mu             sync.RWMutex
 	stopChan       chan struct{}
+	useStorage     bool
 }
 
 // NewExporter creates new Exporter
@@ -69,6 +70,7 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int) {
 	e.storagePath = storagePath
 	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
+	e.useStorage = storagePath != "" && scanIntervalMinutes > 0
 }
 
 func (e *Exporter) runBackgroundScan() {
@@ -98,9 +100,16 @@ func (e *Exporter) performScan() {
 	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Use regular analyzer for scanning
-	analyzer := analyze.CreateAnalyzer()
-	analyzer.SetFollowSymlinks(e.followSymlinks)
+	// Use stored analyzer if storage is configured, otherwise regular analyzer
+	if e.useStorage && e.storagePath != "" {
+		stored := analyze.CreateStoredAnalyzer(e.storagePath)
+		stored.SetFollowSymlinks(e.followSymlinks)
+		e.performAnalysisWithStored(stored)
+	} else {
+		analyzer := analyze.CreateAnalyzer()
+		analyzer.SetFollowSymlinks(e.followSymlinks)
+		e.performAnalysisWithRegular(analyzer)
+	}
 
 	// Initialize cached results map
 	e.mu.Lock()
@@ -109,30 +118,57 @@ func (e *Exporter) performScan() {
 	}
 	e.mu.Unlock()
 
+	log.Info("All background scans completed")
+}
+
+func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 	for path := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting background scan for path: %s", path)
-
+		
 		// Use constGC=true for better memory management during intensive analysis
-		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-
-		// Store results in memory cache
+		
+		// Store results in memory cache (gdu's StoredAnalyzer handles disk storage automatically)
 		e.mu.Lock()
 		e.cachedResults[path] = dir
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
-
+		
 		// Log scan completion time
 		elapsedTime := time.Since(startTime)
 		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
+		
+		// Reset progress for next analysis
+		stored.ResetProgress()
+	}
+}
 
+func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer) {
+	for path := range e.paths {
+		// Track scan time for each path
+		startTime := time.Now()
+		log.Infof("Starting background scan for path: %s", path)
+		
+		// Use constGC=true for better memory management during intensive analysis
+		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir.UpdateStats(fs.HardLinkedItems{})
+		
+		// Store results in memory cache 
+		e.mu.Lock()
+		e.cachedResults[path] = dir
+		e.lastScanTime = time.Now()
+		e.mu.Unlock()
+		
+		// Log scan completion time
+		elapsedTime := time.Since(startTime)
+		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
+		
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
 	}
-
-	log.Info("All background scans completed")
 }
 
 func (e *Exporter) runAnalysis() {
@@ -142,19 +178,50 @@ func (e *Exporter) runAnalysis() {
 	runtime.GOMAXPROCS(12)
 
 	// Create analyzer once and reuse for better performance
-	analyzer := analyze.CreateAnalyzer()
-	analyzer.SetFollowSymlinks(e.followSymlinks)
+	if e.useStorage && e.storagePath != "" {
+		stored := analyze.CreateStoredAnalyzer(e.storagePath)
+		stored.SetFollowSymlinks(e.followSymlinks)
+		e.performLiveAnalysisWithStored(stored)
+	} else {
+		analyzer := analyze.CreateAnalyzer()
+		analyzer.SetFollowSymlinks(e.followSymlinks)
+		e.performLiveAnalysisWithRegular(analyzer)
+	}
 
+	log.Info("All live analysis completed")
+}
+
+func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 	for path, level := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting live analysis for path: %s", path)
+		
+		// Use constGC=true for better memory management during intensive analysis
+		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+		dir.UpdateStats(fs.HardLinkedItems{})
+		e.reportItem(dir, 0, level)
+		
+		// Log scan completion time
+		elapsedTime := time.Since(startTime)
+		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
 
+		// Reset progress for next analysis
+		stored.ResetProgress()
+	}
+}
+
+func (e *Exporter) performLiveAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer) {
+	for path, level := range e.paths {
+		// Track scan time for each path
+		startTime := time.Now()
+		log.Infof("Starting live analysis for path: %s", path)
+		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
-
+		
 		// Log scan completion time
 		elapsedTime := time.Since(startTime)
 		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
@@ -162,8 +229,6 @@ func (e *Exporter) runAnalysis() {
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
 	}
-
-	log.Info("All live analysis completed")
 }
 
 // SetIgnoreDirPaths sets paths to ignore
@@ -184,22 +249,64 @@ func (e *Exporter) shouldDirBeIgnored(_, path string) bool {
 	return ok
 }
 
+// loadFromGduStorage loads cached results from gdu's built-in storage
+func (e *Exporter) loadFromGduStorage() {
+	if !e.useStorage || e.storagePath == "" {
+		return
+	}
+	
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	
+	if e.cachedResults == nil {
+		e.cachedResults = make(map[string]fs.Item)
+	}
+	
+	for path := range e.paths {
+		// Create storage instance for this path
+		storage := analyze.NewStorage(e.storagePath, path)
+		closeFn := storage.Open()
+		
+		// Try to load from storage
+		dir, err := storage.GetDirForPath(path)
+		if err != nil {
+			log.Debugf("Failed to load from gdu storage for path %s: %v", path, err)
+			closeFn()
+			continue
+		}
+		
+		e.cachedResults[path] = dir
+		log.Debugf("Loaded cache data from gdu storage for path: %s", path)
+		closeFn()
+	}
+}
+
 func (e *Exporter) loadFromStorage() {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Check if we have cached results
+	// Check if we have cached results in memory
 	if e.cachedResults == nil {
-		log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
-			e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
-		// Return empty metrics for all paths
-		for path, level := range e.paths {
-			diskUsage.WithLabelValues(path).Set(0)
-			if level >= 1 {
-				diskUsageLevel1.WithLabelValues(path).Set(0)
-			}
+		// Try to load from gdu storage if configured
+		if e.useStorage {
+			e.mu.RUnlock()
+			e.loadFromGduStorage()
+			e.mu.RLock()
 		}
-		return
+		
+		// If still no cached data after trying to load from disk
+		if e.cachedResults == nil {
+			log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
+				e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
+			// Return empty metrics for all paths
+			for path, level := range e.paths {
+				diskUsage.WithLabelValues(path).Set(0)
+				if level >= 1 {
+					diskUsageLevel1.WithLabelValues(path).Set(0)
+				}
+			}
+			return
+		}
 	}
 
 	for path, level := range e.paths {
@@ -219,7 +326,8 @@ func (e *Exporter) loadFromStorage() {
 }
 
 func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
-	if level == maxLevel {
+	// Always report the root path (level 0) and paths at maxLevel
+	if level == 0 || level == maxLevel {
 		diskUsage.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
 	} else if level == 1 {
 		diskUsageLevel1.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
@@ -282,6 +390,8 @@ func (e *Exporter) authorizeReq(w http.ResponseWriter, req *http.Request) bool {
 // StartBackgroundScan starts the background scanning goroutine
 func (e *Exporter) StartBackgroundScan() {
 	if e.storagePath != "" && e.scanInterval > 0 {
+		// Load existing cache data from gdu storage on startup
+		e.loadFromGduStorage()
 		go e.runBackgroundScan()
 		log.Printf("Background scan started with interval: %v", e.scanInterval)
 	}
