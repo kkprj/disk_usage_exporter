@@ -43,6 +43,65 @@ using `--multi-paths` flag:
 disk_usage_exporter --multi-paths=/home=2,/var=3
 ```
 
+## Version Information
+
+You can check the version information using:
+
+```bash
+# CLI version check
+disk_usage_exporter --version
+disk_usage_exporter -v
+disk_usage_exporter version
+
+# API version endpoint
+curl http://localhost:9995/version
+```
+
+## Available Endpoints
+
+When running in HTTP mode, the following endpoints are available:
+
+- **/** - Index page with links to all available endpoints
+- **/metrics** - Prometheus metrics (main endpoint)
+- **/version** - Version information in JSON format
+- **/health** - Health check endpoint
+
+### Health Check Endpoint
+
+The `/health` endpoint provides a simple health check:
+
+```bash
+curl http://localhost:9995/health
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "version": "v0.6.0-6-gc1ec294"
+}
+```
+
+### Version Endpoint
+
+The `/version` endpoint provides detailed version information:
+
+```bash
+curl http://localhost:9995/version
+```
+
+Response:
+```json
+{
+  "buildDate": "Wed Jul 16 17:26:24 KST 2025",
+  "commitSha": "c1ec29420833cbaf67eb925ec950de3a692859b8",
+  "goVersion": "go1.22.2",
+  "goarch": "amd64",
+  "goos": "linux",
+  "version": "v0.6.0-6-gc1ec294"
+}
+```
+
 ## Example output
 
 ```
@@ -161,6 +220,17 @@ scrape_configs:
     - targets: ['localhost:9995']
 ```
 
+**With background caching enabled**, you can use shorter scrape intervals since `/metrics` responses are served from cache:
+
+```yaml
+scrape_configs:
+  - job_name: 'disk-usage'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+    - targets: ['localhost:9995']
+```
+
 ## Dump to file
 
 The official `node-exporter` allows to specify a folder which contains additional metric files through a [textfile collection mechanism](https://github.com/prometheus/node_exporter#textfile-collector).
@@ -208,6 +278,18 @@ When both options are configured:
 - Significantly improves response times for subsequent requests
 
 **Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
+
+### Cache Behavior
+
+- **With caching enabled** (both `storage-path` and `scan-interval-minutes` configured):
+  - Background scanning runs periodically
+  - `/metrics` endpoint serves cached data (fast response)
+  - Empty metrics (0 bytes) returned if cache data is missing
+
+- **Without caching** (default behavior):
+  - `/metrics` endpoint performs live disk analysis (slower response)
+  - No background processes running
+  - Always returns current disk usage
 
 
 ## Example systemd unit file
