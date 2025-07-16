@@ -2,9 +2,13 @@
 # This configuration monitors multiple directories with different depth levels
 
 # Basic configuration
-bind-address: "0.0.0.0:9995"
+bind-address: "0.0.0.0:9996"
 mode: "http"
 follow-symlinks: false
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "debug"
 
 # Multiple paths configuration
 # Each path can have different directory depth levels

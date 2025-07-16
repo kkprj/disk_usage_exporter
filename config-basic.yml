@@ -3,10 +3,14 @@
 
 # Basic configuration
 analyzed-path: "/tmp"
-bind-address: "0.0.0.0:9995"
+bind-address: "0.0.0.0:9996"
 dir-level: 1
 mode: "http"
 follow-symlinks: false
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "debug"
 
 # Directories to ignore during analysis
 ignore-dirs:

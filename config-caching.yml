@@ -2,16 +2,20 @@
 # This configuration enables background caching for better performance
 
 # Basic configuration
-analyzed-path: "/home"
-bind-address: "0.0.0.0:9995"
+analyzed-path: "/mnt/meta-test"
+bind-address: "0.0.0.0:9996"
 dir-level: 2
 mode: "http"
 follow-symlinks: false
 
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "debug"
+
 # Background caching configuration
 # Both storage-path and scan-interval-minutes must be set to enable caching
 storage-path: "/tmp/disk-usage-cache"
-scan-interval-minutes: 15
+scan-interval-minutes: 1
 
 # Directories to ignore during analysis
 ignore-dirs:

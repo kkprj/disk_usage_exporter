@@ -40,6 +40,15 @@ and reporting which directories consume what space.`,
 			return
 		}
 		
+		// Set log level from configuration
+		logLevel := viper.GetString("log-level")
+		if level, err := log.ParseLevel(logLevel); err == nil {
+			log.SetLevel(level)
+		} else {
+			log.Warnf("Invalid log level '%s', using default 'info'", logLevel)
+			log.SetLevel(log.InfoLevel)
+		}
+
 		printHeader()
 
 		paths := transformMultipaths(viper.GetStringMapString("multi-paths"))
@@ -99,6 +108,7 @@ func init() {
 	flags.StringToString("basic-auth-users", map[string]string{}, "Basic Auth users and their passwords as bcypt hashes")
 	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
 	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
+	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
 
 	viper.BindPFlags(flags)
 }

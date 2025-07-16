@@ -29,6 +29,7 @@ Flags:
   -L, --follow-symlinks                   Follow symlinks for files, i.e. show the size of the file to which symlink points to (symlinks to directories are not followed)
   -h, --help                              help for disk_usage_exporter
   -i, --ignore-dirs strings               Absolute paths to ignore (separated by comma) (default [/proc,/dev,/sys,/run,/var/cache/rsnapshot])
+      --log-level string                  Log level (trace, debug, info, warn, error, fatal, panic) (default "info")
   -m, --mode string                       Expose method - either 'file' or 'http' (default "http")
       --multi-paths stringToString        Multiple paths where to analyze disk usage, in format /path1=level1,/path2=level2,... (default [])
   -f, --output-file string                Target file to store metrics in (default "./disk-usage-exporter.prom")
@@ -54,6 +55,12 @@ disk_usage_exporter --storage-path /tmp/cache --scan-interval-minutes 30
 
 # File output mode
 disk_usage_exporter --mode file --output-file metrics.prom
+
+# Debug mode with detailed logging
+disk_usage_exporter --log-level debug --analyzed-path /tmp
+
+# Environment variable configuration
+LOG_LEVEL=debug disk_usage_exporter --config config-basic.yml
 ```
 
 Either one path can be specified using `--analyzed-path` and `--dir-level` flags or multiple can be set
@@ -182,6 +189,10 @@ dir-level: 1
 mode: "http"
 follow-symlinks: false
 
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "info"
+
 ignore-dirs:
   - /proc
   - /dev
@@ -198,6 +209,10 @@ bind-address: "0.0.0.0:9995"
 dir-level: 2
 mode: "http"
 follow-symlinks: false
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "info"
 
 # Background caching configuration
 storage-path: "/tmp/disk-usage-cache"
@@ -218,6 +233,10 @@ ignore-dirs:
 bind-address: "0.0.0.0:9995"
 mode: "http"
 follow-symlinks: false
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "info"
 
 multi-paths:
   /home: 2
@@ -248,11 +267,41 @@ analyzed-path: /
 mode: file
 output-file: ./disk-usage-exporter.prom
 dir-level: 2
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "info"
+
 ignore-dirs:
 - /proc
 - /dev
 - /sys
 - /run
+```
+
+### Debug Configuration (config-debug.yml)
+```yaml
+# Debug configuration for troubleshooting
+analyzed-path: "/tmp"
+bind-address: "0.0.0.0:9995"
+dir-level: 1
+mode: "http"
+follow-symlinks: false
+
+# Log level configuration - Debug mode for troubleshooting
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "debug"
+
+# Background caching configuration
+storage-path: "/tmp/debug-cache"
+scan-interval-minutes: 5
+
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
 ```
 
 ### Usage with Config Files
@@ -265,6 +314,12 @@ ignore-dirs:
 
 # Use config with multiple paths
 ./disk_usage_exporter --config config-multipaths.yml
+
+# Use debug configuration for troubleshooting
+./disk_usage_exporter --config config-debug.yml
+
+# Override config file settings with CLI flags
+./disk_usage_exporter --config config-basic.yml --log-level debug
 ```
 
 ## Prometheus scrape config
@@ -360,6 +415,42 @@ When cached data is unavailable:
 - Continues serving other cached paths normally
 
 **Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
+
+## Logging Configuration
+
+The exporter supports configurable logging levels to help with monitoring and troubleshooting:
+
+### Available Log Levels
+
+| Level | Description | Use Case |
+|-------|-------------|----------|
+| **trace** | Most detailed logging | Development/debugging |
+| **debug** | Debug information including cache operations | Troubleshooting |
+| **info** | General information including scan timings | Production monitoring |
+| **warn** | Warning messages | Production monitoring |
+| **error** | Error messages | Production monitoring |
+| **fatal** | Fatal errors (program exits) | Production monitoring |
+| **panic** | Panic situations | Production monitoring |
+
+### Configuration Methods
+
+1. **Configuration File**: Add `log-level: "debug"` to your config file
+2. **CLI Flag**: Use `--log-level debug` when running the exporter
+3. **Environment Variable**: Set `LOG_LEVEL=debug` environment variable
+
+### Example Log Outputs
+
+**Info Level (default)** - Shows scan timings:
+```
+time="2025-07-16T19:06:39+09:00" level=info msg="Starting live analysis for path: /tmp"
+time="2025-07-16T19:06:39+09:00" level=info msg="Live analysis completed for path: /tmp, elapsed time: 17.242744ms"
+```
+
+**Debug Level** - Shows cache operations:
+```
+time="2025-07-16T19:06:39+09:00" level=debug msg="No cached data found for path: /tmp, returning empty metrics"
+time="2025-07-16T19:06:39+09:00" level=debug msg="Failed to open storage, returning empty metrics"
+```
 
 
 ## Example systemd unit file
