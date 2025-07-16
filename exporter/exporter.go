@@ -266,6 +266,7 @@ func (e *Exporter) RunServer(addr string) {
 	http.Handle("/", http.HandlerFunc(ServeIndex))
 	http.Handle("/metrics", e)
 	http.Handle("/version", http.HandlerFunc(ServeVersion))
+	http.Handle("/health", http.HandlerFunc(ServeHealth))
 
 	// Start background scanning if configured
 	e.StartBackgroundScan()
@@ -275,6 +276,17 @@ func (e *Exporter) RunServer(addr string) {
 	if err != nil {
 		log.Fatal("ListenAndServe:", err)
 	}
+}
+
+// ServeHealth serves health check endpoint
+func ServeHealth(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	healthInfo := map[string]string{
+		"status": "ok",
+		"version": build.BuildVersion,
+	}
+	json.NewEncoder(w).Encode(healthInfo)
 }
 
 // ServeVersion serves version information
@@ -308,6 +320,9 @@ func ServeIndex(w http.ResponseWriter, req *http.Request) {
 </p>
 <p>
 	<a href="/version">Version</a>
+</p>
+<p>
+	<a href="/health">Health</a>
 </p>
 <p>
 	<a href="https://github.com/dundee/disk_usage_exporter">Homepage</a>
