@@ -34,14 +34,30 @@ Flags:
   -f, --output-file string                Target file to store metrics in (default "./disk-usage-exporter.prom")
   -t, --scan-interval-minutes int         Scan interval in minutes for background caching (0 = disabled)
   -s, --storage-path string               Path to store cached analysis data
+  -v, --version                           Print version information and exit
+```
+
+### Quick Start Examples
+
+```bash
+# Basic usage with single path
+disk_usage_exporter --analyzed-path /home --dir-level 2
+
+# Multiple paths with different levels
+disk_usage_exporter --multi-paths=/home=2,/var=3
+
+# Using configuration file
+disk_usage_exporter --config config-basic.yml
+
+# Background caching for better performance
+disk_usage_exporter --storage-path /tmp/cache --scan-interval-minutes 30
+
+# File output mode
+disk_usage_exporter --mode file --output-file metrics.prom
 ```
 
 Either one path can be specified using `--analyzed-path` and `--dir-level` flags or multiple can be set
-using `--multi-paths` flag:
-
-```bash
-disk_usage_exporter --multi-paths=/home=2,/var=3
-```
+using `--multi-paths` flag.
 
 ## Version Information
 
@@ -61,14 +77,16 @@ curl http://localhost:9995/version
 
 When running in HTTP mode, the following endpoints are available:
 
-- **/** - Index page with links to all available endpoints
-- **/metrics** - Prometheus metrics (main endpoint)
-- **/version** - Version information in JSON format
-- **/health** - Health check endpoint
+| Endpoint | Description | Response Format |
+|----------|-------------|----------------|
+| **/** | Index page with links to all available endpoints | HTML |
+| **/metrics** | Prometheus metrics (main endpoint) | Text/Plain |
+| **/version** | Version information | JSON |
+| **/health** | Health check endpoint | JSON |
 
 ### Health Check Endpoint
 
-The `/health` endpoint provides a simple health check:
+The `/health` endpoint provides a simple health check for monitoring systems:
 
 ```bash
 curl http://localhost:9995/health
@@ -153,20 +171,79 @@ sum(node_disk_usage_bytes{path=~"/var.*"})
 
 ## Example config files
 
-`~/.disk_usage_exporter.yaml`:
+Several example configuration files are provided in the repository:
+
+### Basic Configuration (config-basic.yml)
 ```yaml
-analyzed-path: /
-bind-address: 0.0.0.0:9995
-dir-level: 2
+# Basic configuration without caching
+analyzed-path: "/tmp"
+bind-address: "0.0.0.0:9995"
+dir-level: 1
+mode: "http"
+follow-symlinks: false
+
 ignore-dirs:
-- /proc
-- /dev
-- /sys
-- /run
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
 ```
 
-`~/.disk_usage_exporter.yaml`:
+### Configuration with Background Caching (config-caching.yml)
 ```yaml
+# Configuration with background caching for better performance
+analyzed-path: "/home"
+bind-address: "0.0.0.0:9995"
+dir-level: 2
+mode: "http"
+follow-symlinks: false
+
+# Background caching configuration
+storage-path: "/tmp/disk-usage-cache"
+scan-interval-minutes: 15
+
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
+  - /tmp
+```
+
+### Multiple Paths Configuration (config-multipaths.yml)
+```yaml
+# Monitor multiple directories with different depth levels
+bind-address: "0.0.0.0:9995"
+mode: "http"
+follow-symlinks: false
+
+multi-paths:
+  /home: 2
+  /var: 3
+  /tmp: 1
+  /opt: 2
+
+# Background caching configuration
+storage-path: "/tmp/disk-usage-cache"
+scan-interval-minutes: 20
+
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
+
+# Basic authentication (optional)
+# basic-auth-users:
+#   admin: $2b$12$hNf2lSsxfm0.i4a.1kVpSOVyBCfIB51VRjgBUyv6kdnyTlgWj81Ay
+```
+
+### File Output Mode Configuration
+```yaml
+# Output metrics to file instead of HTTP server
 analyzed-path: /
 mode: file
 output-file: ./disk-usage-exporter.prom
@@ -178,32 +255,16 @@ ignore-dirs:
 - /run
 ```
 
-`~/.disk_usage_exporter.yaml`:
-```yaml
-multi-paths:
-  /home: 2
-  /var: 3
-  /tmp: 1
-bind-address: 0.0.0.0:9995
-dir-level: 2
-ignore-dirs:
-- /proc
-- /dev
-- /sys
-- /run
-basic-auth-users:
-  prom: $2b$12$MzUQjmLxPRM9WW6OI4ZzwuZHB7ubHiiSnngJxIufgZms27nw.5ZAq
-```
+### Usage with Config Files
+```bash
+# Use specific config file
+./disk_usage_exporter --config config-basic.yml
 
-`~/.disk_usage_exporter.yaml` (with background caching):
-```yaml
-analyzed-path: /mnt
-bind-address: 0.0.0.0:9995
-dir-level: 1
-mode: http
-follow-symlinks: false
-storage-path: /var/cache/gdu
-scan-interval-minutes: 30
+# Use config with background caching
+./disk_usage_exporter --config config-caching.yml
+
+# Use config with multiple paths
+./disk_usage_exporter --config config-multipaths.yml
 ```
 
 ## Prometheus scrape config
@@ -271,25 +332,34 @@ storage-path: /var/cache/gdu
 scan-interval-minutes: 30
 ```
 
-When both options are configured:
-- Background scanning runs every `scan-interval-minutes` minutes
-- Analysis results are cached in the `storage-path` directory
-- `/metrics` API responses use cached data instead of performing live analysis
-- Significantly improves response times for subsequent requests
+### How Background Caching Works
 
-**Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
+1. **Background Process**: A separate goroutine runs periodic scans
+2. **Data Storage**: Results are cached using BadgerDB key-value store
+3. **Fast Response**: `/metrics` endpoint serves cached data instantly
+4. **Auto-cleanup**: Storage handles cleanup of old data automatically
 
 ### Cache Behavior
 
-- **With caching enabled** (both `storage-path` and `scan-interval-minutes` configured):
-  - Background scanning runs periodically
-  - `/metrics` endpoint serves cached data (fast response)
-  - Empty metrics (0 bytes) returned if cache data is missing
+| Mode | Background Scan | Response Time | Data Freshness |
+|------|----------------|---------------|----------------|
+| **With caching enabled** | ✅ Runs every N minutes | ⚡ Fast (cached) | Updated every N minutes |
+| **Without caching** | ❌ None | 🐌 Slow (live analysis) | Real-time |
 
-- **Without caching** (default behavior):
-  - `/metrics` endpoint performs live disk analysis (slower response)
-  - No background processes running
-  - Always returns current disk usage
+### Configuration Requirements
+
+- **Both required**: `storage-path` AND `scan-interval-minutes` must be set
+- **Permissions**: Storage path must be writable by the exporter process
+- **Disk space**: Minimal storage required (typically < 1MB per analyzed path)
+
+### Cache Miss Behavior
+
+When cached data is unavailable:
+- Returns empty metrics (0 bytes) for missing paths
+- Logs debug message about missing cache data
+- Continues serving other cached paths normally
+
+**Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
 
 
 ## Example systemd unit file

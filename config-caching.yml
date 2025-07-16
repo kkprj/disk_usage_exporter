@@ -1,0 +1,23 @@
+# Disk Usage Prometheus Exporter Configuration with Background Caching
+# This configuration enables background caching for better performance
+
+# Basic configuration
+analyzed-path: "/home"
+bind-address: "0.0.0.0:9995"
+dir-level: 2
+mode: "http"
+follow-symlinks: false
+
+# Background caching configuration
+# Both storage-path and scan-interval-minutes must be set to enable caching
+storage-path: "/tmp/disk-usage-cache"
+scan-interval-minutes: 15
+
+# Directories to ignore during analysis
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
+  - /tmp
