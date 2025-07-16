@@ -98,7 +98,8 @@ func (e *Exporter) performScan() {
 	defer debug.FreeOSMemory()
 
 	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	maxProcs := runtime.GOMAXPROCS(runtime.NumCPU())
+	log.Infof("Using %d CPU cores for parallel scanning (GOMAXPROCS=%d)", runtime.NumCPU(), maxProcs)
 
 	// Use stored analyzer if storage is configured, otherwise regular analyzer
 	if e.useStorage && e.storagePath != "" {
@@ -125,7 +126,7 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 	for path := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
-		log.Infof("Starting background scan for path: %s", path)
+		log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
@@ -137,9 +138,9 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
-		// Log scan completion time
+		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
-		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
+		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
 		
 		// Reset progress for next analysis
 		stored.ResetProgress()
@@ -150,7 +151,7 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 	for path := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
-		log.Infof("Starting background scan for path: %s", path)
+		log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
@@ -162,9 +163,9 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
-		// Log scan completion time
+		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
-		log.Infof("Background scan completed for path: %s, elapsed time: %v", path, elapsedTime)
+		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
 		
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
@@ -175,7 +176,8 @@ func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
 	// Set max cores to 12 for SSD high-performance scanning (equivalent to gdu -m 12)
-	runtime.GOMAXPROCS(12)
+	maxProcs := runtime.GOMAXPROCS(12)
+	log.Infof("Using 12 CPU cores for live analysis (GOMAXPROCS=%d)", maxProcs)
 
 	// Create analyzer once and reuse for better performance
 	if e.useStorage && e.storagePath != "" {
@@ -195,16 +197,16 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 	for path, level := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
-		log.Infof("Starting live analysis for path: %s", path)
+		log.Infof("Starting live analysis for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
 		
-		// Log scan completion time
+		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
-		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
+		log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
 
 		// Reset progress for next analysis
 		stored.ResetProgress()
@@ -215,16 +217,16 @@ func (e *Exporter) performLiveAnalysisWithRegular(analyzer *analyze.ParallelAnal
 	for path, level := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
-		log.Infof("Starting live analysis for path: %s", path)
+		log.Infof("Starting live analysis for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.reportItem(dir, 0, level)
 		
-		// Log scan completion time
+		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
-		log.Infof("Live analysis completed for path: %s, elapsed time: %v", path, elapsedTime)
+		log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
 
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
