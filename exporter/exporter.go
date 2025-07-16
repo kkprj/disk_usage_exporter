@@ -219,7 +219,7 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Use cached storage data if available, otherwise run analysis
-	if e.storagePath != "" {
+	if e.storagePath != "" && e.scanInterval > 0 {
 		e.loadFromStorage()
 	} else {
 		e.runAnalysis()
