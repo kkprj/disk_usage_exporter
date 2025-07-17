@@ -12,6 +12,10 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
 
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
 # Background caching configuration (optional)
 # Both storage-path and scan-interval-minutes must be set to enable caching
 storage-path: "/tmp/gdu-cache"

@@ -3,7 +3,7 @@
 
 # Basic configuration
 # analyzed-path: "/mnt/meta-test"
-analyzed-path: "/home"
+analyzed-path: "/mnt/meta-test"
 bind-address: "0.0.0.0:9996"
 dir-level: 1
 mode: "http"
@@ -12,6 +12,10 @@ follow-symlinks: false
 # Log level configuration
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
+
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 12
 
 # Background caching configuration
 # Both storage-path and scan-interval-minutes must be set to enable caching

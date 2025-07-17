@@ -10,6 +10,10 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
 
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
 # Multiple paths configuration
 # Each path can have different directory depth levels
 multi-paths:

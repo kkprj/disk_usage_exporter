@@ -55,6 +55,7 @@ type Exporter struct {
 	mu             sync.RWMutex
 	stopChan       chan struct{}
 	useStorage     bool
+	maxProcs       int
 }
 
 // NewExporter creates new Exporter
@@ -63,6 +64,7 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 		followSymlinks: followSymlinks,
 		paths:          paths,
 		stopChan:       make(chan struct{}),
+		maxProcs:       4, // default value
 	}
 }
 
@@ -71,6 +73,14 @@ func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int)
 	e.storagePath = storagePath
 	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
 	e.useStorage = storagePath != "" && scanIntervalMinutes > 0
+}
+
+// SetMaxProcs sets the maximum number of CPU cores to use
+func (e *Exporter) SetMaxProcs(maxProcs int) {
+	if maxProcs <= 0 {
+		maxProcs = 4 // default value
+	}
+	e.maxProcs = maxProcs
 }
 
 func (e *Exporter) runBackgroundScan() {
@@ -97,9 +107,9 @@ func (e *Exporter) runBackgroundScan() {
 func (e *Exporter) performScan() {
 	defer debug.FreeOSMemory()
 
-	// Set max cores for parallel scanning (equivalent to gdu -m $(nproc))
-	maxProcs := runtime.GOMAXPROCS(runtime.NumCPU())
-	log.Infof("Using %d CPU cores for parallel scanning (GOMAXPROCS=%d)", runtime.NumCPU(), maxProcs)
+	// Set max cores for parallel scanning from config
+	runtime.GOMAXPROCS(e.maxProcs)
+	log.Infof("Using %d CPU cores for parallel scanning (GOMAXPROCS=%d)", e.maxProcs, runtime.GOMAXPROCS(0))
 
 	// Use stored analyzer if storage is configured, otherwise regular analyzer
 	if e.useStorage && e.storagePath != "" {
@@ -175,9 +185,9 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
-	// Set max cores to 12 for SSD high-performance scanning (equivalent to gdu -m 12)
-	maxProcs := runtime.GOMAXPROCS(12)
-	log.Infof("Using 12 CPU cores for live analysis (GOMAXPROCS=%d)", maxProcs)
+	// Set max cores for live analysis from config
+	runtime.GOMAXPROCS(e.maxProcs)
+	log.Infof("Using %d CPU cores for live analysis (GOMAXPROCS=%d)", e.maxProcs, runtime.GOMAXPROCS(0))
 
 	// Create analyzer once and reuse for better performance
 	if e.useStorage && e.storagePath != "" {

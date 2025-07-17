@@ -76,6 +76,9 @@ and reporting which directories consume what space.`,
 		if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
 			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"))
 		}
+		
+		// Configure max processors
+		e.SetMaxProcs(viper.GetInt("max-procs"))
 
 		if viper.GetString("mode") == "file" {
 			e.WriteToTextfile(viper.GetString("output-file"))
@@ -115,6 +118,7 @@ func init() {
 	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
 	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
 	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
+	flags.IntP("max-procs", "j", 4, "Maximum number of CPU cores to use for parallel processing")
 
 	viper.BindPFlags(flags)
 }

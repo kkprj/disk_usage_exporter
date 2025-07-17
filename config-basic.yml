@@ -12,6 +12,10 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
 
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
 # Directories to ignore during analysis
 ignore-dirs:
   - /proc

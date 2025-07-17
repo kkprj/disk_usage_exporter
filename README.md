@@ -30,6 +30,7 @@ Flags:
   -h, --help                              help for disk_usage_exporter
   -i, --ignore-dirs strings               Absolute paths to ignore (separated by comma) (default [/proc,/dev,/sys,/run,/var/cache/rsnapshot])
       --log-level string                  Log level (trace, debug, info, warn, error, fatal, panic) (default "info")
+  -j, --max-procs int                     Maximum number of CPU cores to use for parallel processing (default 4)
   -m, --mode string                       Expose method - either 'file' or 'http' (default "http")
       --multi-paths stringToString        Multiple paths where to analyze disk usage, in format /path1=level1,/path2=level2,... (default [])
   -f, --output-file string                Target file to store metrics in (default "./disk-usage-exporter.prom")
@@ -58,6 +59,9 @@ disk_usage_exporter --mode file --output-file metrics.prom
 
 # Debug mode with detailed logging
 disk_usage_exporter --log-level debug --analyzed-path /tmp
+
+# Use 8 CPU cores for better performance
+disk_usage_exporter --max-procs 8 --analyzed-path /home
 
 # Environment variable configuration
 LOG_LEVEL=debug disk_usage_exporter --config config-basic.yml
@@ -193,6 +197,10 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
 
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
 ignore-dirs:
   - /proc
   - /dev
@@ -213,6 +221,10 @@ follow-symlinks: false
 # Log level configuration
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
+
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 8
 
 # Background caching configuration
 storage-path: "/tmp/disk-usage-cache"
@@ -237,6 +249,10 @@ follow-symlinks: false
 # Log level configuration
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
+
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 6
 
 multi-paths:
   /home: 2
@@ -272,6 +288,10 @@ dir-level: 2
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
 
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
 ignore-dirs:
 - /proc
 - /dev
@@ -291,6 +311,10 @@ follow-symlinks: false
 # Log level configuration - Debug mode for troubleshooting
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
+
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 2
 
 # Background caching configuration
 storage-path: "/tmp/debug-cache"
@@ -320,6 +344,9 @@ ignore-dirs:
 
 # Override config file settings with CLI flags
 ./disk_usage_exporter --config config-basic.yml --log-level debug
+
+# Use custom CPU core count for performance tuning
+./disk_usage_exporter --config config-basic.yml --max-procs 8
 ```
 
 ## Prometheus scrape config
@@ -415,6 +442,92 @@ When cached data is unavailable:
 - Continues serving other cached paths normally
 
 **Note:** If either `storage-path` or `scan-interval-minutes` is not set, the exporter will perform live disk analysis for each `/metrics` request (default behavior).
+
+## Performance and CPU Configuration
+
+The exporter supports configurable CPU core usage for optimal performance across different hardware configurations:
+
+### CPU Cores Configuration
+
+| Configuration | Default | Recommended Usage |
+|---------------|---------|-------------------|
+| **max-procs** | 4 | Number of CPU cores to use for parallel processing |
+
+### Performance Tuning Guidelines
+
+**Small filesystems** (< 1GB):
+```yaml
+max-procs: 2  # Minimal resources needed
+```
+
+**Medium filesystems** (1GB - 100GB):
+```yaml
+max-procs: 4  # Default setting, good balance
+```
+
+**Large filesystems** (> 100GB):
+```yaml
+max-procs: 8  # Higher parallelism for better performance
+```
+
+**SSD storage** (high I/O performance):
+```yaml
+max-procs: 12  # Can handle more parallel operations
+```
+
+### Configuration Methods
+
+1. **Configuration File**: Add `max-procs: 8` to your config file
+2. **CLI Flag**: Use `--max-procs 8` or `-j 8` when running the exporter
+3. **Environment Variable**: Set `MAX_PROCS=8` environment variable
+
+### Performance Impact
+
+| CPU Cores | Typical Performance | Memory Usage | Recommended For |
+|-----------|-------------------|--------------|----------------|
+| **1-2** | Basic performance | Low | Small filesystems, resource-constrained environments |
+| **4** | Balanced (default) | Medium | Most production environments |
+| **6-8** | High performance | Medium-High | Large filesystems, high-performance requirements |
+| **12+** | Maximum performance | High | SSD storage, very large filesystems |
+
+### Monitoring Performance
+
+The exporter logs CPU usage and performance metrics:
+
+```
+time="2025-07-17T08:27:02+09:00" level=info msg="Using 8 CPU cores for live analysis (GOMAXPROCS=8)"
+time="2025-07-17T08:27:02+09:00" level=info msg="Starting live analysis for path: /home, initial goroutines: 4"
+time="2025-07-17T08:27:05+09:00" level=info msg="Live analysis completed for path: /home, elapsed time: 2.845s, goroutines: 4"
+```
+
+**Key metrics to monitor:**
+- **CPU cores used**: Number of cores allocated for processing
+- **Elapsed time**: Time taken for analysis
+- **Goroutines**: Active concurrent operations
+
+### Performance Best Practices
+
+1. **Start with default (4 cores)** and monitor performance
+2. **Increase cores** if analysis takes too long on large filesystems
+3. **Decrease cores** in resource-constrained environments
+4. **Use background caching** for consistent performance across multiple requests
+5. **Monitor system resources** to avoid over-allocation
+
+### Example Performance Configurations
+
+```bash
+# Development environment (low resources)
+./disk_usage_exporter --max-procs 2 --analyzed-path /home
+
+# Production environment (balanced)
+./disk_usage_exporter --max-procs 4 --config config-basic.yml
+
+# High-performance environment (fast SSD)
+./disk_usage_exporter --max-procs 12 --config config-caching.yml
+
+# Resource-constrained environment
+./disk_usage_exporter --max-procs 1 --analyzed-path /tmp
+```
 
 ## Logging Configuration
 
