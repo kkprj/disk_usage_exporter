@@ -108,9 +108,7 @@ func (e *Exporter) runBackgroundScan() {
 func (e *Exporter) performScan() {
 	defer debug.FreeOSMemory()
 
-	// Set max cores for parallel scanning from config
-	runtime.GOMAXPROCS(e.maxProcs)
-	log.Infof("Using %d CPU cores for parallel scanning (GOMAXPROCS=%d)", e.maxProcs, runtime.GOMAXPROCS(0))
+	log.Infof("Using %d CPU cores for parallel scanning (gdu internal parallelization)", e.maxProcs)
 
 	// Use stored analyzer if storage is configured, otherwise regular analyzer
 	if e.useStorage && e.storagePath != "" {
@@ -208,9 +206,7 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
-	// Set max cores for live analysis from config
-	runtime.GOMAXPROCS(e.maxProcs)
-	log.Infof("Using %d CPU cores for live analysis (GOMAXPROCS=%d)", e.maxProcs, runtime.GOMAXPROCS(0))
+	log.Infof("Using %d CPU cores for live analysis (gdu internal parallelization)", e.maxProcs)
 
 	// Create analyzer once and reuse for better performance
 	if e.useStorage && e.storagePath != "" {
