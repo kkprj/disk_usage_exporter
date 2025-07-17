@@ -1,6 +1,6 @@
 NAME := disk_usage_exporter
 PACKAGE := github.com/dundee/$(NAME)
-VERSION := $(shell git describe --tags 2>/dev/null)
+VERSION := $(shell git tag -l | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$$" | sort -V | tail -1 2>/dev/null)-$(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null)
 GOFLAGS ?= -buildmode=pie -trimpath -mod=readonly -modcacherw
 LDFLAGS := -s -w -extldflags '-static' \
