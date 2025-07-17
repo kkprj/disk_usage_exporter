@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,9 +114,22 @@ func (e *Exporter) performScan() {
 
 	// Use stored analyzer if storage is configured, otherwise regular analyzer
 	if e.useStorage && e.storagePath != "" {
-		stored := analyze.CreateStoredAnalyzer(e.storagePath)
-		stored.SetFollowSymlinks(e.followSymlinks)
-		e.performAnalysisWithStored(stored)
+		// Handle potential database lock errors during storage analyzer creation
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("Storage analyzer creation failed, falling back to regular analyzer: %v", r)
+					analyzer := analyze.CreateAnalyzer()
+					analyzer.SetFollowSymlinks(e.followSymlinks)
+					e.performAnalysisWithRegular(analyzer)
+					return
+				}
+			}()
+			
+			stored := analyze.CreateStoredAnalyzer(e.storagePath)
+			stored.SetFollowSymlinks(e.followSymlinks)
+			e.performAnalysisWithStored(stored)
+		}()
 	} else {
 		analyzer := analyze.CreateAnalyzer()
 		analyzer.SetFollowSymlinks(e.followSymlinks)
@@ -139,18 +153,27 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 		log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
-		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
-		dir.UpdateStats(fs.HardLinkedItems{})
-		
-		// Store results in memory cache (gdu's StoredAnalyzer handles disk storage automatically)
-		e.mu.Lock()
-		e.cachedResults[path] = dir
-		e.lastScanTime = time.Now()
-		e.mu.Unlock()
-		
-		// Log scan completion time with goroutine stats
-		elapsedTime := time.Since(startTime)
-		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
+		// Handle potential database lock errors during analysis
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("Background scan panic recovered for path %s: %v", path, r)
+				}
+			}()
+			
+			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+			dir.UpdateStats(fs.HardLinkedItems{})
+			
+			// Store results in memory cache (gdu's StoredAnalyzer handles disk storage automatically)
+			e.mu.Lock()
+			e.cachedResults[path] = dir
+			e.lastScanTime = time.Now()
+			e.mu.Unlock()
+			
+			// Log scan completion time with goroutine stats
+			elapsedTime := time.Since(startTime)
+			log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
+		}()
 		
 		// Reset progress for next analysis
 		stored.ResetProgress()
@@ -210,13 +233,27 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 		log.Infof("Starting live analysis for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
-		dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
-		dir.UpdateStats(fs.HardLinkedItems{})
-		e.reportItem(dir, 0, level)
-		
-		// Log scan completion time with goroutine stats
-		elapsedTime := time.Since(startTime)
-		log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
+		// Handle potential database lock errors during analysis
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("Live analysis panic recovered for path %s: %v", path, r)
+					// Set zero values for metrics when analysis fails
+					diskUsage.WithLabelValues(path).Set(0)
+					if level >= 1 {
+						diskUsageLevel1.WithLabelValues(path).Set(0)
+					}
+				}
+			}()
+			
+			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+			dir.UpdateStats(fs.HardLinkedItems{})
+			e.reportItem(dir, 0, level)
+			
+			// Log scan completion time with goroutine stats
+			elapsedTime := time.Since(startTime)
+			log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
+		}()
 
 		// Reset progress for next analysis
 		stored.ResetProgress()
@@ -279,11 +316,16 @@ func (e *Exporter) loadFromGduStorage() {
 		storage := analyze.NewStorage(e.storagePath, path)
 		closeFn := storage.Open()
 		
-		// Try to load from storage
+		// Try to load from storage with error handling for database lock
 		dir, err := storage.GetDirForPath(path)
 		if err != nil {
 			log.Debugf("Failed to load from gdu storage for path %s: %v", path, err)
 			closeFn()
+			// If it's a database lock error, log a warning and continue without cached data
+			if strings.Contains(err.Error(), "resource temporarily unavailable") || 
+			   strings.Contains(err.Error(), "another process is using this badger database") {
+				log.Warnf("Database lock detected for path %s, continuing without cached data", path)
+			}
 			continue
 		}
 		
