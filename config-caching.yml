@@ -5,7 +5,7 @@
 # analyzed-path: "/mnt/meta-test"
 analyzed-path: "/home"
 bind-address: "0.0.0.0:9996"
-dir-level: 1
+dir-level: 4
 mode: "http"
 follow-symlinks: false
 

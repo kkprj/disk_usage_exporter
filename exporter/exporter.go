@@ -24,16 +24,9 @@ var (
 			Name: "node_disk_usage_bytes",
 			Help: "Disk usage of the directory/file",
 		},
-		[]string{"path", "level"},
+		[]string{"path", "level", "type"},
 	)
-	diskUsageLevel1 = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "node_disk_usage_level_1_bytes",
-			Help: "Disk usage of the directory/file level 1",
-		},
-		[]string{"path"},
-	)
-	collectors = []prometheus.Collector{diskUsage, diskUsageLevel1}
+	collectors = []prometheus.Collector{diskUsage}
 )
 
 // writeRequest represents a request to write analysis results to storage
@@ -356,16 +349,15 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 				if r := recover(); r != nil {
 					log.Warnf("Live analysis panic recovered for path %s: %v", path, r)
 					// Set zero values for metrics when analysis fails
-					diskUsage.WithLabelValues(path, "0").Set(0)
-					if level >= 1 {
-						diskUsageLevel1.WithLabelValues(path).Set(0)
+					for i := 0; i <= level; i++ {
+						diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
 					}
 				}
 			}()
 			
 			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 			dir.UpdateStats(fs.HardLinkedItems{})
-			e.reportItem(dir, 0, level)
+			e.reportItem(dir, 0, level, path)
 			
 			// Log scan completion time with goroutine stats
 			elapsedTime := time.Since(startTime)
@@ -386,7 +378,7 @@ func (e *Exporter) performLiveAnalysisWithRegular(analyzer *analyze.ParallelAnal
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-		e.reportItem(dir, 0, level)
+		e.reportItem(dir, 0, level, path)
 		
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
@@ -426,9 +418,8 @@ func (e *Exporter) loadFromStorage() {
 			e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
 		// Return empty metrics for all paths
 		for path, level := range e.paths {
-			diskUsage.WithLabelValues(path, "0").Set(0)
-			if level >= 1 {
-				diskUsageLevel1.WithLabelValues(path).Set(0)
+			for i := 0; i <= level; i++ {
+				diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
 			}
 		}
 		return
@@ -440,22 +431,26 @@ func (e *Exporter) loadFromStorage() {
 			log.Debugf("No cached data found for path: %s, returning empty metrics - storagePath: %s, scanInterval: %v, followSymlinks: %v",
 				path, e.storagePath, e.scanInterval, e.followSymlinks)
 			// Return empty metrics (0 bytes) for missing cache data
-			diskUsage.WithLabelValues(path, "0").Set(0)
-			if level >= 1 {
-				diskUsageLevel1.WithLabelValues(path).Set(0)
+			for i := 0; i <= level; i++ {
+				diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
 			}
 			continue
 		}
-		e.reportItem(dir, 0, level)
+		e.reportItem(dir, 0, level, path)
 	}
 }
 
-func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
-	// Always report the root path (level 0) and paths at maxLevel
-	if level == 0 || level == maxLevel {
-		diskUsage.WithLabelValues(item.GetPath(), fmt.Sprintf("%d", level)).Set(float64(item.GetUsage()))
-	} else if level == 1 {
-		diskUsageLevel1.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
+func (e *Exporter) reportItem(item fs.Item, level, maxLevel int, rootPath string) {
+	// Report all levels from 0 to maxLevel with consistent format
+	// For intermediate levels (1+), exclude the root path itself
+	if level <= maxLevel {
+		if level == 0 || item.GetPath() != rootPath {
+			itemType := "file"
+			if item.IsDir() {
+				itemType = "directory"
+			}
+			diskUsage.WithLabelValues(item.GetPath(), fmt.Sprintf("%d", level), itemType).Set(float64(item.GetUsage()))
+		}
 	}
 
 	if item.IsDir() && level+1 <= maxLevel {
@@ -479,7 +474,7 @@ func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
 				if entry == nil {
 					continue
 				}
-				e.reportItem(entry, level+1, maxLevel)
+				e.reportItem(entry, level+1, maxLevel, rootPath)
 			}
 		}()
 	}
