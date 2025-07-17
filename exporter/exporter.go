@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +36,13 @@ var (
 	collectors = []prometheus.Collector{diskUsage, diskUsageLevel1}
 )
 
+// writeRequest represents a request to write analysis results to storage
+type writeRequest struct {
+	path   string
+	result fs.Item
+	done   chan error
+}
+
 func init() {
 	prometheus.MustRegister(collectors...)
 }
@@ -57,6 +63,12 @@ type Exporter struct {
 	stopChan       chan struct{}
 	useStorage     bool
 	maxProcs       int
+	
+	// Sequential DB write components
+	sharedStorage  *analyze.Storage
+	storageMutex   sync.Mutex
+	writeQueue     chan writeRequest
+	writerDone     chan struct{}
 }
 
 // NewExporter creates new Exporter
@@ -66,6 +78,8 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 		paths:          paths,
 		stopChan:       make(chan struct{}),
 		maxProcs:       4, // default value
+		writeQueue:     make(chan writeRequest, 100), // Buffer for write requests
+		writerDone:     make(chan struct{}),
 	}
 }
 
@@ -74,6 +88,10 @@ func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int)
 	e.storagePath = storagePath
 	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
 	e.useStorage = storagePath != "" && scanIntervalMinutes > 0
+	
+	// Skip storage initialization to prevent circular reference issues
+	// Only use memory cache for background scans
+	log.Infof("Storage writes disabled to prevent circular reference issues, using memory-only cache")
 }
 
 // SetMaxProcs sets the maximum number of CPU cores to use
@@ -82,6 +100,65 @@ func (e *Exporter) SetMaxProcs(maxProcs int) {
 		maxProcs = 4 // default value
 	}
 	e.maxProcs = maxProcs
+}
+
+// initializeSharedStorage initializes shared storage and starts writer goroutine
+func (e *Exporter) initializeSharedStorage() {
+	e.storageMutex.Lock()
+	defer e.storageMutex.Unlock()
+	
+	if e.sharedStorage == nil {
+		e.sharedStorage = analyze.NewStorage(e.storagePath, "")
+		if e.sharedStorage != nil {
+			closeFn := e.sharedStorage.Open()
+			if closeFn != nil {
+				e.storageCloseFn = closeFn
+				// Start writer goroutine
+				go e.runStorageWriter()
+			}
+		}
+	}
+}
+
+// runStorageWriter runs the sequential DB write goroutine
+func (e *Exporter) runStorageWriter() {
+	defer close(e.writerDone)
+	
+	for {
+		select {
+		case req := <-e.writeQueue:
+			err := e.writeToStorage(req.path, req.result)
+			if req.done != nil {
+				req.done <- err
+			}
+		case <-e.stopChan:
+			return
+		}
+	}
+}
+
+// writeToStorage writes analysis result to storage sequentially
+func (e *Exporter) writeToStorage(path string, result fs.Item) error {
+	e.storageMutex.Lock()
+	defer e.storageMutex.Unlock()
+	
+	if e.sharedStorage == nil {
+		return fmt.Errorf("shared storage not initialized")
+	}
+	
+	// Store the result in BadgerDB
+	return e.sharedStorage.StoreDir(result)
+}
+
+// queueStorageWrite queues a write request for sequential processing
+func (e *Exporter) queueStorageWrite(path string, result fs.Item) {
+	select {
+	case e.writeQueue <- writeRequest{path: path, result: result, done: nil}:
+		// Queued successfully
+	default:
+		// Queue is full, log warning
+		log.Warnf("Storage write queue is full, dropping write request for path: %s", path)
+	}
 }
 
 func (e *Exporter) runBackgroundScan() {
@@ -145,36 +222,80 @@ func (e *Exporter) performScan() {
 }
 
 func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
+	// Use WaitGroup for parallel analysis
+	var wg sync.WaitGroup
+	
+	// Channel for results to prevent race conditions
+	resultChan := make(chan struct {
+		path   string
+		result fs.Item
+		elapsed time.Duration
+	}, len(e.paths))
+	
+	// Start parallel analysis for each path
 	for path := range e.paths {
-		// Track scan time for each path
-		startTime := time.Now()
-		log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
-		
-		// Use constGC=true for better memory management during intensive analysis
-		// Handle potential database lock errors during analysis
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warnf("Background scan panic recovered for path %s: %v", path, r)
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			
+			// Track scan time for each path
+			startTime := time.Now()
+			log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
+			
+			// Use constGC=true for better memory management during intensive analysis
+			// Handle potential database lock errors during analysis
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Warnf("Background scan panic recovered for path %s: %v", path, r)
+						return
+					}
+				}()
+				
+				// Create separate analyzer for each path to avoid conflicts
+				pathAnalyzer := analyze.CreateAnalyzer()
+				pathAnalyzer.SetFollowSymlinks(e.followSymlinks)
+				
+				dir := pathAnalyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
+				dir.UpdateStats(fs.HardLinkedItems{})
+				
+				// Send result to channel
+				resultChan <- struct {
+					path   string
+					result fs.Item
+					elapsed time.Duration
+				}{
+					path:    path,
+					result:  dir,
+					elapsed: time.Since(startTime),
 				}
 			}()
-			
-			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
-			dir.UpdateStats(fs.HardLinkedItems{})
-			
-			// Store results in memory cache (gdu's StoredAnalyzer handles disk storage automatically)
-			e.mu.Lock()
-			e.cachedResults[path] = dir
-			e.lastScanTime = time.Now()
-			e.mu.Unlock()
-			
-			// Log scan completion time with goroutine stats
-			elapsedTime := time.Since(startTime)
-			log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
-		}()
+		}(path)
+	}
+	
+	// Wait for all analysis to complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Process results and queue for sequential DB writes
+	for result := range resultChan {
+		// Store results in memory cache immediately
+		e.mu.Lock()
+		if e.cachedResults == nil {
+			e.cachedResults = make(map[string]fs.Item)
+		}
+		e.cachedResults[result.path] = result.result
+		e.lastScanTime = time.Now()
+		e.mu.Unlock()
 		
-		// Reset progress for next analysis
-		stored.ResetProgress()
+		// Skip storage writes to prevent circular reference issues
+		// Storage writes cause stack overflow due to gob serialization of fs.Item
+		// Memory cache is sufficient for HTTP requests
+		
+		// Log scan completion time with goroutine stats
+		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", result.path, result.elapsed, runtime.NumGoroutine())
 	}
 }
 
@@ -294,42 +415,6 @@ func (e *Exporter) shouldDirBeIgnored(_, path string) bool {
 	return ok
 }
 
-// loadFromGduStorage loads cached results from gdu's built-in storage
-func (e *Exporter) loadFromGduStorage() {
-	if !e.useStorage || e.storagePath == "" {
-		return
-	}
-	
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	
-	if e.cachedResults == nil {
-		e.cachedResults = make(map[string]fs.Item)
-	}
-	
-	for path := range e.paths {
-		// Create storage instance for this path
-		storage := analyze.NewStorage(e.storagePath, path)
-		closeFn := storage.Open()
-		
-		// Try to load from storage with error handling for database lock
-		dir, err := storage.GetDirForPath(path)
-		if err != nil {
-			log.Debugf("Failed to load from gdu storage for path %s: %v", path, err)
-			closeFn()
-			// If it's a database lock error, log a warning and continue without cached data
-			if strings.Contains(err.Error(), "resource temporarily unavailable") || 
-			   strings.Contains(err.Error(), "another process is using this badger database") {
-				log.Warnf("Database lock detected for path %s, continuing without cached data", path)
-			}
-			continue
-		}
-		
-		e.cachedResults[path] = dir
-		log.Debugf("Loaded cache data from gdu storage for path: %s", path)
-		closeFn()
-	}
-}
 
 func (e *Exporter) loadFromStorage() {
 	e.mu.RLock()
@@ -337,26 +422,16 @@ func (e *Exporter) loadFromStorage() {
 
 	// Check if we have cached results in memory
 	if e.cachedResults == nil {
-		// Try to load from gdu storage if configured
-		if e.useStorage {
-			e.mu.RUnlock()
-			e.loadFromGduStorage()
-			e.mu.RLock()
-		}
-		
-		// If still no cached data after trying to load from disk
-		if e.cachedResults == nil {
-			log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
-				e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
-			// Return empty metrics for all paths
-			for path, level := range e.paths {
-				diskUsage.WithLabelValues(path, "0").Set(0)
-				if level >= 1 {
-					diskUsageLevel1.WithLabelValues(path).Set(0)
-				}
+		log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
+			e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
+		// Return empty metrics for all paths
+		for path, level := range e.paths {
+			diskUsage.WithLabelValues(path, "0").Set(0)
+			if level >= 1 {
+				diskUsageLevel1.WithLabelValues(path).Set(0)
 			}
-			return
 		}
+		return
 	}
 
 	for path, level := range e.paths {
@@ -384,9 +459,29 @@ func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
 	}
 
 	if item.IsDir() && level+1 <= maxLevel {
-		for _, entry := range item.GetFiles() {
-			e.reportItem(entry, level+1, maxLevel)
-		}
+		// Safe handling of GetFiles() to prevent nil pointer panics
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warnf("Storage access error during reportItem for %s: %v", item.GetPath(), r)
+					return
+				}
+			}()
+			
+			// GetFiles() may panic if BadgerDB connection is closed
+			files := item.GetFiles()
+			if files == nil {
+				log.Debugf("No files found for directory: %s", item.GetPath())
+				return
+			}
+			
+			for _, entry := range files {
+				if entry == nil {
+					continue
+				}
+				e.reportItem(entry, level+1, maxLevel)
+			}
+		}()
 	}
 }
 
@@ -440,8 +535,6 @@ func (e *Exporter) authorizeReq(w http.ResponseWriter, req *http.Request) bool {
 // StartBackgroundScan starts the background scanning goroutine
 func (e *Exporter) StartBackgroundScan() {
 	if e.storagePath != "" && e.scanInterval > 0 {
-		// Load existing cache data from gdu storage on startup
-		e.loadFromGduStorage()
 		go e.runBackgroundScan()
 		log.Printf("Background scan started with interval: %v", e.scanInterval)
 	}
@@ -450,14 +543,27 @@ func (e *Exporter) StartBackgroundScan() {
 // Stop stops the background scanning
 func (e *Exporter) Stop() {
 	close(e.stopChan)
+	
+	// Wait for writer goroutine to finish if it was started
+	if e.useStorage && e.writerDone != nil {
+		<-e.writerDone
+	}
+	
+	// Close the write queue to prevent new writes
+	if e.writeQueue != nil {
+		close(e.writeQueue)
+	}
+	
 	if e.storageCloseFn != nil {
 		e.storageCloseFn()
 	}
+	
 	// Clean up cached results
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cachedResults = nil
 	e.storage = nil
+	e.sharedStorage = nil
 }
 
 // RunServer starts HTTP server loop
