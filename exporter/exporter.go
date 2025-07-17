@@ -25,7 +25,7 @@ var (
 			Name: "node_disk_usage_bytes",
 			Help: "Disk usage of the directory/file",
 		},
-		[]string{"path"},
+		[]string{"path", "level"},
 	)
 	diskUsageLevel1 = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -239,7 +239,7 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 				if r := recover(); r != nil {
 					log.Warnf("Live analysis panic recovered for path %s: %v", path, r)
 					// Set zero values for metrics when analysis fails
-					diskUsage.WithLabelValues(path).Set(0)
+					diskUsage.WithLabelValues(path, "0").Set(0)
 					if level >= 1 {
 						diskUsageLevel1.WithLabelValues(path).Set(0)
 					}
@@ -354,7 +354,7 @@ func (e *Exporter) loadFromStorage() {
 				e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
 			// Return empty metrics for all paths
 			for path, level := range e.paths {
-				diskUsage.WithLabelValues(path).Set(0)
+				diskUsage.WithLabelValues(path, "0").Set(0)
 				if level >= 1 {
 					diskUsageLevel1.WithLabelValues(path).Set(0)
 				}
@@ -369,7 +369,7 @@ func (e *Exporter) loadFromStorage() {
 			log.Debugf("No cached data found for path: %s, returning empty metrics - storagePath: %s, scanInterval: %v, followSymlinks: %v",
 				path, e.storagePath, e.scanInterval, e.followSymlinks)
 			// Return empty metrics (0 bytes) for missing cache data
-			diskUsage.WithLabelValues(path).Set(0)
+			diskUsage.WithLabelValues(path, "0").Set(0)
 			if level >= 1 {
 				diskUsageLevel1.WithLabelValues(path).Set(0)
 			}
@@ -382,7 +382,7 @@ func (e *Exporter) loadFromStorage() {
 func (e *Exporter) reportItem(item fs.Item, level, maxLevel int) {
 	// Always report the root path (level 0) and paths at maxLevel
 	if level == 0 || level == maxLevel {
-		diskUsage.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
+		diskUsage.WithLabelValues(item.GetPath(), fmt.Sprintf("%d", level)).Set(float64(item.GetUsage()))
 	} else if level == 1 {
 		diskUsageLevel1.WithLabelValues(item.GetPath()).Set(float64(item.GetUsage()))
 	}
