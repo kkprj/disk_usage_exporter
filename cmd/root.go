@@ -20,12 +20,41 @@ var (
 	cfgFile string
 )
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version number",
+	Run: func(cmd *cobra.Command, args []string) {
+		printVersion()
+	},
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "disk_usage_exporter",
 	Short: "Prometheus exporter for detailed disk usage info",
 	Long: `Prometheus exporter analysing disk usage of the filesystem
 and reporting which directories consume what space.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Check if version flag is set
+		if versionFlag, _ := cmd.Flags().GetBool("version"); versionFlag {
+			printVersion()
+			return
+		}
+		
+		// Set log level from configuration
+		logLevel := viper.GetString("log-level")
+		if level, err := log.ParseLevel(logLevel); err == nil {
+			log.SetLevel(level)
+		} else {
+			log.Warnf("Invalid log level '%s', using default 'info'", logLevel)
+			log.SetLevel(log.InfoLevel)
+		}
+		
+		// Set log formatter to include timestamps
+		log.SetFormatter(&log.TextFormatter{
+			TimestampFormat: "2006-01-02 15:04:05",
+			FullTimestamp:   true,
+		})
+
 		printHeader()
 
 		paths := transformMultipaths(viper.GetStringMapString("multi-paths"))
@@ -42,6 +71,14 @@ and reporting which directories consume what space.`,
 		if viper.IsSet("basic-auth-users") {
 			e.SetBasicAuth(viper.GetStringMapString("basic-auth-users"))
 		}
+
+		// Configure storage and scan interval if specified
+		if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
+			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"))
+		}
+		
+		// Configure max processors
+		e.SetMaxProcs(viper.GetInt("max-procs"))
 
 		if viper.GetString("mode") == "file" {
 			e.WriteToTextfile(viper.GetString("output-file"))
@@ -62,7 +99,9 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize(initConfig)
+	rootCmd.AddCommand(versionCmd)
 	flags := rootCmd.PersistentFlags()
+	flags.BoolP("version", "v", false, "Print version information and exit")
 	flags.StringVarP(&cfgFile, "config", "c", "", "config file (default is $HOME/.disk_usage_exporter.yaml)")
 	flags.StringP("mode", "m", "http", "Expose method - either 'file' or 'http'")
 	flags.StringP("bind-address", "b", "0.0.0.0:9995", "Address to bind to")
@@ -76,6 +115,10 @@ func init() {
 	)
 	flags.StringToString("multi-paths", map[string]string{}, "Multiple paths where to analyze disk usage, in format /path1=level1,/path2=level2,...")
 	flags.StringToString("basic-auth-users", map[string]string{}, "Basic Auth users and their passwords as bcypt hashes")
+	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
+	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
+	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
+	flags.IntP("max-procs", "j", 4, "Maximum number of CPU cores to use for parallel processing")
 
 	viper.BindPFlags(flags)
 }
@@ -104,6 +147,17 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
 	}
+}
+
+func printVersion() {
+	fmt.Printf("Disk Usage Prometheus Exporter %s\nbuild date: %s\nsha1: %s\nGo: %s\nGOOS: %s\nGOARCH: %s\n",
+		build.BuildVersion,
+		build.BuildDate,
+		build.BuildCommitSha,
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
 }
 
 func printHeader() {

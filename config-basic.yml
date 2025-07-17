@@ -1,0 +1,25 @@
+# Basic Disk Usage Prometheus Exporter Configuration
+# This configuration runs without background caching (live analysis mode)
+
+# Basic configuration
+analyzed-path: "/tmp"
+bind-address: "0.0.0.0:9996"
+dir-level: 1
+mode: "http"
+follow-symlinks: false
+
+# Log level configuration
+# Available levels: trace, debug, info, warn, error, fatal, panic
+log-level: "debug"
+
+# CPU cores configuration
+# Maximum number of CPU cores to use for parallel processing
+max-procs: 4
+
+# Directories to ignore during analysis
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
