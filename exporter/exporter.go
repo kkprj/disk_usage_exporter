@@ -99,6 +99,7 @@ type writeRequest struct {
 
 // aggregatedStats holds aggregated statistics for a directory
 type aggregatedStats struct {
+	sync.Mutex
 	path           string
 	level          int
 	totalSize      int64
@@ -163,6 +164,7 @@ type Exporter struct {
 	
 	// Aggregated statistics storage
 	aggregatedStats map[string]*aggregatedStats
+	statsMutex      sync.RWMutex
 	topNLimit       int
 }
 
@@ -555,7 +557,10 @@ func (e *Exporter) loadFromStorage() {
 
 // analyzeAndAggregate performs analysis and creates aggregated statistics
 func (e *Exporter) analyzeAndAggregate(item fs.Item, level, maxLevel int, rootPath string) {
+	e.statsMutex.Lock()
 	e.aggregatedStats = make(map[string]*aggregatedStats)
+	e.statsMutex.Unlock()
+	
 	e.collectAggregatedStats(item, level, maxLevel, rootPath)
 	e.publishAggregatedMetrics()
 }
@@ -570,6 +575,8 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	
 	// Initialize aggregated stats for this path/level if it doesn't exist
 	key := fmt.Sprintf("%s:%d", path, level)
+	
+	e.statsMutex.Lock()
 	if e.aggregatedStats[key] == nil {
 		e.aggregatedStats[key] = &aggregatedStats{
 			path:        path,
@@ -578,11 +585,12 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			topFiles:    make([]topFileInfo, 0),
 		}
 	}
-	
 	stats := e.aggregatedStats[key]
+	e.statsMutex.Unlock()
 	
 	// Update directory-level statistics
 	if level == 0 || path != rootPath {
+		stats.Lock()
 		stats.totalSize += item.GetUsage()
 		
 		if item.IsDir() {
@@ -596,9 +604,10 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			sizeRange := getSizeRange(item.GetUsage())
 			stats.sizeBuckets[sizeRange]++
 			
-			// Track for top-N files
-			e.updateTopFiles(stats, path, item.GetUsage())
+			// Track for top-N files (already locked)
+			e.updateTopFilesLocked(stats, path, item.GetUsage())
 		}
+		stats.Unlock()
 	}
 
 	// Recursively process subdirectories
@@ -627,8 +636,8 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	}
 }
 
-// updateTopFiles maintains the top-N largest files list
-func (e *Exporter) updateTopFiles(stats *aggregatedStats, path string, size int64) {
+// updateTopFilesLocked maintains the top-N largest files list (assumes stats is already locked)
+func (e *Exporter) updateTopFilesLocked(stats *aggregatedStats, path string, size int64) {
 	if len(stats.topFiles) < e.topNLimit {
 		stats.topFiles = append(stats.topFiles, topFileInfo{
 			path: path,
@@ -662,7 +671,11 @@ func (e *Exporter) updateTopFiles(stats *aggregatedStats, path string, size int6
 
 // publishAggregatedMetrics publishes all aggregated metrics to Prometheus
 func (e *Exporter) publishAggregatedMetrics() {
+	e.statsMutex.RLock()
+	defer e.statsMutex.RUnlock()
+	
 	for _, stats := range e.aggregatedStats {
+		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
 		
 		// Directory-level metrics
@@ -689,6 +702,7 @@ func (e *Exporter) publishAggregatedMetrics() {
 			diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
 			diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
 		}
+		stats.Unlock()
 	}
 }
 
