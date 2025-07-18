@@ -17,6 +17,10 @@ log-level: "debug"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 12
 
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: true
+
 # Background caching configuration
 # Both storage-path and scan-interval-minutes must be set to enable caching
 storage-path: "/tmp/disk-usage-cache"

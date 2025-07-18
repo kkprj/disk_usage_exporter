@@ -22,6 +22,10 @@ multi-paths:
   /tmp: 1
   /opt: 2
 
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: true
+
 # Background caching configuration (optional)
 storage-path: "/tmp/disk-usage-cache"
 scan-interval-minutes: 20
