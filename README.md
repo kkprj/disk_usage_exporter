@@ -35,6 +35,7 @@ Flags:
   -b, --bind-address string               Address to bind to (default "0.0.0.0:9995")
   -c, --config string                     config file (default is $HOME/.disk_usage_exporter.yaml)
   -l, --dir-level int                     Directory nesting level to show (0 = only selected dir) (default 2)
+      --dir-only                          Only analyze directories, exclude individual files from metrics
   -L, --follow-symlinks                   Follow symlinks for files, i.e. show the size of the file to which symlink points to (symlinks to directories are not followed)
   -h, --help                              help for disk_usage_exporter
   -i, --ignore-dirs strings               Absolute paths to ignore (separated by comma) (default [/proc,/dev,/sys,/run,/var/cache/rsnapshot])
@@ -71,6 +72,9 @@ disk_usage_exporter --log-level debug --analyzed-path /tmp
 
 # Use 8 CPU cores for better performance
 disk_usage_exporter --max-procs 8 --analyzed-path /home
+
+# Directory-only mode (exclude individual files from metrics)
+disk_usage_exporter --dir-only --analyzed-path /home
 
 # Environment variable configuration
 LOG_LEVEL=debug disk_usage_exporter --config config-basic.yml
@@ -310,6 +314,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: false
+
 ignore-dirs:
   - /proc
   - /dev
@@ -334,6 +342,10 @@ log-level: "info"
 # CPU cores configuration
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 8
+
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: false
 
 # Background caching configuration
 storage-path: "/tmp/disk-usage-cache"
@@ -362,6 +374,10 @@ log-level: "info"
 # CPU cores configuration
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 6
+
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: false
 
 multi-paths:
   /home: 2
@@ -401,6 +417,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: false
+
 ignore-dirs:
 - /proc
 - /dev
@@ -424,6 +444,10 @@ log-level: "debug"
 # CPU cores configuration
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 2
+
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: false
 
 # Background caching configuration
 storage-path: "/tmp/debug-cache"
@@ -696,6 +720,76 @@ time="2025-07-18T13:38:41+09:00" level=info msg="Memory usage: ~50MB (99% reduct
 ./disk_usage_exporter --max-procs 1 --analyzed-path /tmp
 ```
 
+## Directory-Only Mode
+
+The exporter supports a **directory-only mode** that excludes individual files from metrics collection, analyzing only directories. This is useful for:
+
+- **Ultra-low memory usage**: Further reduces memory footprint by excluding file-level statistics
+- **Directory structure analysis**: Focus on directory hierarchy without file-level details
+- **Performance optimization**: Faster analysis when file-level metrics are not needed
+- **Storage optimization**: Reduced metrics output for cleaner dashboards
+
+### Configuration
+
+#### CLI Flag
+```bash
+# Enable directory-only mode
+./disk_usage_exporter --dir-only --analyzed-path /home
+
+# Disable directory-only mode (default)
+./disk_usage_exporter --analyzed-path /home
+```
+
+#### Configuration File
+```yaml
+# Enable directory-only mode
+dir-only: true
+
+# Disable directory-only mode (default)
+dir-only: false
+```
+
+### Metrics Behavior
+
+**With dir-only enabled (`dir-only: true`)**:
+- `node_disk_usage_file_count` shows 0 for all directories
+- `node_disk_usage_size_bucket` shows 0 for all size ranges
+- `node_disk_usage_top_files` is empty
+- `node_disk_usage_others_*` metrics show 0
+- `node_disk_usage_by_type_bytes{type="file"}` shows 0
+- Directory-level metrics work normally
+
+**With dir-only disabled (`dir-only: false`, default)**:
+- All metrics include both files and directories
+- Complete analysis of the filesystem
+
+### Example Use Cases
+
+**Directory structure monitoring**:
+```yaml
+# Monitor directory sizes without file details
+analyzed-path: /mnt/storage
+dir-only: true
+dir-level: 3
+```
+
+**Memory-constrained environments**:
+```yaml
+# Minimal memory usage for large filesystems
+analyzed-path: /home
+dir-only: true
+dir-level: 2
+max-procs: 2
+```
+
+**Configuration management**:
+```yaml
+# Monitor configuration directories without individual config files
+analyzed-path: /etc
+dir-only: true
+dir-level: 2
+```
+
 ## Logging Configuration
 
 The exporter supports configurable logging levels to help with monitoring and troubleshooting:
@@ -754,6 +848,9 @@ log-level: info
 max-procs: 8
 storage-path: /var/cache/disk-usage-exporter
 scan-interval-minutes: 30
+
+# Directory-only mode for minimal memory usage (optional)
+# dir-only: true
 
 # Security
 basic-auth-users:

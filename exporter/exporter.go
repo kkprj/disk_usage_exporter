@@ -135,6 +135,34 @@ func getSizeRange(size int64) string {
 	}
 }
 
+// setScanningState sets the scanning state
+func (e *Exporter) setScanningState(scanning bool) {
+	e.scanMutex.Lock()
+	defer e.scanMutex.Unlock()
+	e.isScanning = scanning
+}
+
+// isCurrentlyScanning returns true if scan is in progress
+func (e *Exporter) isCurrentlyScanning() bool {
+	e.scanMutex.RLock()
+	defer e.scanMutex.RUnlock()
+	return e.isScanning
+}
+
+// setValidResults marks that we have valid scan results
+func (e *Exporter) setValidResults(valid bool) {
+	e.scanMutex.Lock()
+	defer e.scanMutex.Unlock()
+	e.hasValidResults = valid
+}
+
+// hasValidScanResults returns true if we have valid cached results
+func (e *Exporter) hasValidScanResults() bool {
+	e.scanMutex.RLock()
+	defer e.scanMutex.RUnlock()
+	return e.hasValidResults
+}
+
 func init() {
 	prometheus.MustRegister(collectors...)
 }
@@ -155,6 +183,7 @@ type Exporter struct {
 	stopChan       chan struct{}
 	useStorage     bool
 	maxProcs       int
+	dirOnly        bool
 	
 	// Sequential DB write components
 	sharedStorage  *analyze.Storage
@@ -166,6 +195,15 @@ type Exporter struct {
 	aggregatedStats map[string]*aggregatedStats
 	statsMutex      sync.RWMutex
 	topNLimit       int
+	
+	// Scan state tracking
+	isScanning      bool
+	scanMutex       sync.RWMutex
+	hasValidResults bool
+	
+	// Temporary stats during scanning
+	tempStats       map[string]*aggregatedStats
+	tempStatsMutex  sync.RWMutex
 }
 
 // NewExporter creates new Exporter
@@ -178,6 +216,7 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 		writeQueue:      make(chan writeRequest, 100), // Buffer for write requests
 		writerDone:      make(chan struct{}),
 		aggregatedStats: make(map[string]*aggregatedStats),
+		tempStats:       make(map[string]*aggregatedStats),
 		topNLimit:       1000, // Track top 1000 largest files
 	}
 }
@@ -199,6 +238,11 @@ func (e *Exporter) SetMaxProcs(maxProcs int) {
 		maxProcs = 4 // default value
 	}
 	e.maxProcs = maxProcs
+}
+
+// SetDirOnly sets whether to analyze only directories or include files
+func (e *Exporter) SetDirOnly(dirOnly bool) {
+	e.dirOnly = dirOnly
 }
 
 // initializeSharedStorage initializes shared storage and starts writer goroutine
@@ -428,6 +472,10 @@ func (e *Exporter) runAnalysis() {
 
 	log.Infof("Using %d CPU cores for live analysis (gdu internal parallelization)", e.maxProcs)
 
+	// Set scanning state
+	e.setScanningState(true)
+	defer e.setScanningState(false)
+
 	// Create analyzer once and reuse for better performance
 	if e.useStorage && e.storagePath != "" {
 		stored := analyze.CreateStoredAnalyzer(e.storagePath)
@@ -439,7 +487,35 @@ func (e *Exporter) runAnalysis() {
 		e.performLiveAnalysisWithRegular(analyzer)
 	}
 
+	// Mark that we have valid results
+	e.setValidResults(true)
+
 	log.Info("All live analysis completed")
+}
+
+// runAnalysisAsync runs analysis in background without blocking
+func (e *Exporter) runAnalysisAsync() {
+	go func() {
+		e.runAnalysis()
+	}()
+}
+
+// provideEmptyMetrics provides empty metrics when no scan results are available
+func (e *Exporter) provideEmptyMetrics() {
+	for path, level := range e.paths {
+		for i := 0; i <= level; i++ {
+			levelStr := fmt.Sprintf("%d", i)
+			diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
+			diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+			diskUsageByType.WithLabelValues(path, "directory", levelStr).Set(0)
+			
+			// Only provide file-related metrics if dir-only is disabled
+			if !e.dirOnly {
+				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+				diskUsageByType.WithLabelValues(path, "file", levelStr).Set(0)
+			}
+		}
+	}
 }
 
 func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer) {
@@ -458,8 +534,10 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 					for i := 0; i <= level; i++ {
 						levelStr := fmt.Sprintf("%d", i)
 						diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-						diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 						diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+						if !e.dirOnly {
+							diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+						}
 					}
 				}
 			}()
@@ -530,8 +608,10 @@ func (e *Exporter) loadFromStorage() {
 			for i := 0; i <= level; i++ {
 				levelStr := fmt.Sprintf("%d", i)
 				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+				if !e.dirOnly {
+					diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+				}
 			}
 		}
 		return
@@ -546,8 +626,10 @@ func (e *Exporter) loadFromStorage() {
 			for i := 0; i <= level; i++ {
 				levelStr := fmt.Sprintf("%d", i)
 				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+				if !e.dirOnly {
+					diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+				}
 			}
 			continue
 		}
@@ -557,11 +639,21 @@ func (e *Exporter) loadFromStorage() {
 
 // analyzeAndAggregate performs analysis and creates aggregated statistics
 func (e *Exporter) analyzeAndAggregate(item fs.Item, level, maxLevel int, rootPath string) {
-	e.statsMutex.Lock()
-	e.aggregatedStats = make(map[string]*aggregatedStats)
-	e.statsMutex.Unlock()
+	// Use temporary stats during scanning to not interfere with current results
+	e.tempStatsMutex.Lock()
+	e.tempStats = make(map[string]*aggregatedStats)
+	e.tempStatsMutex.Unlock()
 	
 	e.collectAggregatedStats(item, level, maxLevel, rootPath)
+	
+	// After collection is complete, atomically replace the main stats
+	e.statsMutex.Lock()
+	e.tempStatsMutex.Lock()
+	e.aggregatedStats = e.tempStats
+	e.tempStats = make(map[string]*aggregatedStats)
+	e.tempStatsMutex.Unlock()
+	e.statsMutex.Unlock()
+	
 	e.publishAggregatedMetrics()
 }
 
@@ -573,20 +665,25 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 
 	path := item.GetPath()
 	
+	// Skip files entirely if dir-only mode is enabled
+	if e.dirOnly && !item.IsDir() {
+		return
+	}
+	
 	// Initialize aggregated stats for this path/level if it doesn't exist
 	key := fmt.Sprintf("%s:%d", path, level)
 	
-	e.statsMutex.Lock()
-	if e.aggregatedStats[key] == nil {
-		e.aggregatedStats[key] = &aggregatedStats{
+	e.tempStatsMutex.Lock()
+	if e.tempStats[key] == nil {
+		e.tempStats[key] = &aggregatedStats{
 			path:        path,
 			level:       level,
 			sizeBuckets: make(map[string]int64),
 			topFiles:    make([]topFileInfo, 0),
 		}
 	}
-	stats := e.aggregatedStats[key]
-	e.statsMutex.Unlock()
+	stats := e.tempStats[key]
+	e.tempStatsMutex.Unlock()
 	
 	// Update directory-level statistics
 	if level == 0 || path != rootPath {
@@ -596,7 +693,8 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 		if item.IsDir() {
 			stats.directoryCount++
 			stats.directorySize += item.GetUsage()
-		} else {
+		} else if !e.dirOnly {
+			// Only process files if dir-only mode is disabled
 			stats.fileCount++
 			stats.fileSize += item.GetUsage()
 			
@@ -680,28 +778,35 @@ func (e *Exporter) publishAggregatedMetrics() {
 		
 		// Directory-level metrics
 		diskUsageDirectory.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
-		diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
 		diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
 		
-		// Type-based metrics
-		diskUsageByType.WithLabelValues(stats.path, "file", levelStr).Set(float64(stats.fileSize))
+		// File-related metrics - only publish if dir-only is disabled
+		if !e.dirOnly {
+			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
+			
+			// Type-based metrics for files
+			diskUsageByType.WithLabelValues(stats.path, "file", levelStr).Set(float64(stats.fileSize))
+			
+			// Size bucket metrics
+			for sizeRange, count := range stats.sizeBuckets {
+				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
+			}
+			
+			// Top-N file metrics
+			for _, topFile := range stats.topFiles {
+				diskUsageTopFiles.WithLabelValues(topFile.path, fmt.Sprintf("%d", topFile.rank)).Set(float64(topFile.size))
+			}
+			
+			// Others metrics
+			if stats.othersTotal > 0 {
+				diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
+				diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
+			}
+		}
+		
+		// Directory type-based metrics (always published)
 		diskUsageByType.WithLabelValues(stats.path, "directory", levelStr).Set(float64(stats.directorySize))
 		
-		// Size bucket metrics
-		for sizeRange, count := range stats.sizeBuckets {
-			diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
-		}
-		
-		// Top-N file metrics
-		for _, topFile := range stats.topFiles {
-			diskUsageTopFiles.WithLabelValues(topFile.path, fmt.Sprintf("%d", topFile.rank)).Set(float64(topFile.size))
-		}
-		
-		// Others metrics
-		if stats.othersTotal > 0 {
-			diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
-			diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
-		}
 		stats.Unlock()
 	}
 }
@@ -728,12 +833,27 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Use cached storage data if available, otherwise run analysis
+	// Handle metrics request with immediate response
 	if e.storagePath != "" && e.scanInterval > 0 {
+		// Background caching mode - use cached results or empty metrics
 		e.loadFromStorage()
 	} else {
-		e.runAnalysis()
+		// Live analysis mode - check if scan is needed
+		if e.hasValidScanResults() {
+			// We have previous results, use them
+			log.Debugf("Using cached analysis results")
+		} else if e.isCurrentlyScanning() {
+			// Scan is in progress, provide empty metrics
+			log.Debugf("Scan in progress, providing empty metrics")
+			e.provideEmptyMetrics()
+		} else {
+			// No scan in progress and no results, start async scan and provide empty metrics
+			log.Debugf("Starting background scan, providing empty metrics")
+			e.runAnalysisAsync()
+			e.provideEmptyMetrics()
+		}
 	}
+	
 	promhttp.Handler().ServeHTTP(w, req)
 }
 

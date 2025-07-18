@@ -16,6 +16,10 @@ log-level: "debug"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
+# Directory-only mode configuration
+# Only analyze directories, exclude individual files from metrics
+dir-only: true
+
 # Directories to ignore during analysis
 ignore-dirs:
   - /proc
