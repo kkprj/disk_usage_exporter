@@ -19,14 +19,75 @@ import (
 )
 
 var (
-	diskUsage = prometheus.NewGaugeVec(
+	// 계층적 집계 메트릭
+	diskUsageDirectory = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "node_disk_usage_bytes",
-			Help: "Disk usage of the directory/file",
+			Name: "node_disk_usage_directory_bytes",
+			Help: "Total disk usage by directory",
 		},
-		[]string{"path", "level", "type"},
+		[]string{"path", "level"},
 	)
-	collectors = []prometheus.Collector{diskUsage}
+	diskUsageFileCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_file_count",
+			Help: "Number of files in directory",
+		},
+		[]string{"path", "level"},
+	)
+	diskUsageDirectoryCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_directory_count",
+			Help: "Number of subdirectories in directory",
+		},
+		[]string{"path", "level"},
+	)
+	
+	// 타입별 집계 메트릭
+	diskUsageByType = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_by_type_bytes",
+			Help: "Disk usage aggregated by file type",
+		},
+		[]string{"path", "type", "level"},
+	)
+	
+	// 크기별 버킷 메트릭
+	diskUsageSizeBucket = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_size_bucket",
+			Help: "File count by size range",
+		},
+		[]string{"path", "size_range", "level"},
+	)
+	
+	// Top-N 파일 메트릭
+	diskUsageTopFiles = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_top_files",
+			Help: "Top N largest files",
+		},
+		[]string{"path", "rank"},
+	)
+	diskUsageOthersTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_others_total",
+			Help: "Total size of files not in top N",
+		},
+		[]string{"path"},
+	)
+	diskUsageOthersCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "node_disk_usage_others_count",
+			Help: "Count of files not in top N",
+		},
+		[]string{"path"},
+	)
+	
+	collectors = []prometheus.Collector{
+		diskUsageDirectory, diskUsageFileCount, diskUsageDirectoryCount,
+		diskUsageByType, diskUsageSizeBucket, diskUsageTopFiles,
+		diskUsageOthersTotal, diskUsageOthersCount,
+	}
 )
 
 // writeRequest represents a request to write analysis results to storage
@@ -34,6 +95,43 @@ type writeRequest struct {
 	path   string
 	result fs.Item
 	done   chan error
+}
+
+// aggregatedStats holds aggregated statistics for a directory
+type aggregatedStats struct {
+	path           string
+	level          int
+	totalSize      int64
+	fileCount      int64
+	directoryCount int64
+	fileSize       int64
+	directorySize  int64
+	sizeBuckets    map[string]int64  // size_range -> count
+	topFiles       []topFileInfo     // largest files
+	othersTotal    int64
+	othersCount    int64
+}
+
+// topFileInfo holds information about large files
+type topFileInfo struct {
+	path string
+	size int64
+	rank int
+}
+
+// getSizeRange returns the size range bucket for a given file size
+func getSizeRange(size int64) string {
+	if size == 0 {
+		return "0B"
+	} else if size <= 1024 {
+		return "0-1KB"
+	} else if size <= 1024*1024 {
+		return "1KB-1MB"
+	} else if size <= 100*1024*1024 {
+		return "1MB-100MB"
+	} else {
+		return "100MB+"
+	}
 }
 
 func init() {
@@ -62,17 +160,23 @@ type Exporter struct {
 	storageMutex   sync.Mutex
 	writeQueue     chan writeRequest
 	writerDone     chan struct{}
+	
+	// Aggregated statistics storage
+	aggregatedStats map[string]*aggregatedStats
+	topNLimit       int
 }
 
 // NewExporter creates new Exporter
 func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	return &Exporter{
-		followSymlinks: followSymlinks,
-		paths:          paths,
-		stopChan:       make(chan struct{}),
-		maxProcs:       4, // default value
-		writeQueue:     make(chan writeRequest, 100), // Buffer for write requests
-		writerDone:     make(chan struct{}),
+		followSymlinks:  followSymlinks,
+		paths:           paths,
+		stopChan:        make(chan struct{}),
+		maxProcs:        4, // default value
+		writeQueue:      make(chan writeRequest, 100), // Buffer for write requests
+		writerDone:      make(chan struct{}),
+		aggregatedStats: make(map[string]*aggregatedStats),
+		topNLimit:       1000, // Track top 1000 largest files
 	}
 }
 
@@ -350,14 +454,17 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 					log.Warnf("Live analysis panic recovered for path %s: %v", path, r)
 					// Set zero values for metrics when analysis fails
 					for i := 0; i <= level; i++ {
-						diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
+						levelStr := fmt.Sprintf("%d", i)
+						diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
+						diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+						diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
 					}
 				}
 			}()
 			
 			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 			dir.UpdateStats(fs.HardLinkedItems{})
-			e.reportItem(dir, 0, level, path)
+			e.analyzeAndAggregate(dir, 0, level, path)
 			
 			// Log scan completion time with goroutine stats
 			elapsedTime := time.Since(startTime)
@@ -378,7 +485,7 @@ func (e *Exporter) performLiveAnalysisWithRegular(analyzer *analyze.ParallelAnal
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-		e.reportItem(dir, 0, level, path)
+		e.analyzeAndAggregate(dir, 0, level, path)
 		
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
@@ -419,7 +526,10 @@ func (e *Exporter) loadFromStorage() {
 		// Return empty metrics for all paths
 		for path, level := range e.paths {
 			for i := 0; i <= level; i++ {
-				diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
+				levelStr := fmt.Sprintf("%d", i)
+				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
+				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
 			}
 		}
 		return
@@ -432,41 +542,78 @@ func (e *Exporter) loadFromStorage() {
 				path, e.storagePath, e.scanInterval, e.followSymlinks)
 			// Return empty metrics (0 bytes) for missing cache data
 			for i := 0; i <= level; i++ {
-				diskUsage.WithLabelValues(path, fmt.Sprintf("%d", i), "directory").Set(0)
+				levelStr := fmt.Sprintf("%d", i)
+				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
+				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
+				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
 			}
 			continue
 		}
-		e.reportItem(dir, 0, level, path)
+		e.analyzeAndAggregate(dir, 0, level, path)
 	}
 }
 
-func (e *Exporter) reportItem(item fs.Item, level, maxLevel int, rootPath string) {
-	// Report all levels from 0 to maxLevel with consistent format
-	// For intermediate levels (1+), exclude the root path itself
-	if level <= maxLevel {
-		if level == 0 || item.GetPath() != rootPath {
-			itemType := "file"
-			if item.IsDir() {
-				itemType = "directory"
-			}
-			diskUsage.WithLabelValues(item.GetPath(), fmt.Sprintf("%d", level), itemType).Set(float64(item.GetUsage()))
+// analyzeAndAggregate performs analysis and creates aggregated statistics
+func (e *Exporter) analyzeAndAggregate(item fs.Item, level, maxLevel int, rootPath string) {
+	e.aggregatedStats = make(map[string]*aggregatedStats)
+	e.collectAggregatedStats(item, level, maxLevel, rootPath)
+	e.publishAggregatedMetrics()
+}
+
+// collectAggregatedStats recursively collects statistics for aggregation
+func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, rootPath string) {
+	if level > maxLevel {
+		return
+	}
+
+	path := item.GetPath()
+	
+	// Initialize aggregated stats for this path/level if it doesn't exist
+	key := fmt.Sprintf("%s:%d", path, level)
+	if e.aggregatedStats[key] == nil {
+		e.aggregatedStats[key] = &aggregatedStats{
+			path:        path,
+			level:       level,
+			sizeBuckets: make(map[string]int64),
+			topFiles:    make([]topFileInfo, 0),
+		}
+	}
+	
+	stats := e.aggregatedStats[key]
+	
+	// Update directory-level statistics
+	if level == 0 || path != rootPath {
+		stats.totalSize += item.GetUsage()
+		
+		if item.IsDir() {
+			stats.directoryCount++
+			stats.directorySize += item.GetUsage()
+		} else {
+			stats.fileCount++
+			stats.fileSize += item.GetUsage()
+			
+			// Update size buckets
+			sizeRange := getSizeRange(item.GetUsage())
+			stats.sizeBuckets[sizeRange]++
+			
+			// Track for top-N files
+			e.updateTopFiles(stats, path, item.GetUsage())
 		}
 	}
 
+	// Recursively process subdirectories
 	if item.IsDir() && level+1 <= maxLevel {
-		// Safe handling of GetFiles() to prevent nil pointer panics
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Warnf("Storage access error during reportItem for %s: %v", item.GetPath(), r)
+					log.Warnf("Storage access error during collectAggregatedStats for %s: %v", path, r)
 					return
 				}
 			}()
 			
-			// GetFiles() may panic if BadgerDB connection is closed
 			files := item.GetFiles()
 			if files == nil {
-				log.Debugf("No files found for directory: %s", item.GetPath())
+				log.Debugf("No files found for directory: %s", path)
 				return
 			}
 			
@@ -474,9 +621,74 @@ func (e *Exporter) reportItem(item fs.Item, level, maxLevel int, rootPath string
 				if entry == nil {
 					continue
 				}
-				e.reportItem(entry, level+1, maxLevel, rootPath)
+				e.collectAggregatedStats(entry, level+1, maxLevel, rootPath)
 			}
 		}()
+	}
+}
+
+// updateTopFiles maintains the top-N largest files list
+func (e *Exporter) updateTopFiles(stats *aggregatedStats, path string, size int64) {
+	if len(stats.topFiles) < e.topNLimit {
+		stats.topFiles = append(stats.topFiles, topFileInfo{
+			path: path,
+			size: size,
+			rank: len(stats.topFiles) + 1,
+		})
+	} else {
+		// Find smallest in top-N and replace if current is larger
+		minIdx := 0
+		minSize := stats.topFiles[0].size
+		for i, file := range stats.topFiles {
+			if file.size < minSize {
+				minIdx = i
+				minSize = file.size
+			}
+		}
+		
+		if size > minSize {
+			stats.topFiles[minIdx] = topFileInfo{
+				path: path,
+				size: size,
+				rank: minIdx + 1,
+			}
+		} else {
+			// Add to others total
+			stats.othersTotal += size
+			stats.othersCount++
+		}
+	}
+}
+
+// publishAggregatedMetrics publishes all aggregated metrics to Prometheus
+func (e *Exporter) publishAggregatedMetrics() {
+	for _, stats := range e.aggregatedStats {
+		levelStr := fmt.Sprintf("%d", stats.level)
+		
+		// Directory-level metrics
+		diskUsageDirectory.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
+		diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
+		diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
+		
+		// Type-based metrics
+		diskUsageByType.WithLabelValues(stats.path, "file", levelStr).Set(float64(stats.fileSize))
+		diskUsageByType.WithLabelValues(stats.path, "directory", levelStr).Set(float64(stats.directorySize))
+		
+		// Size bucket metrics
+		for sizeRange, count := range stats.sizeBuckets {
+			diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
+		}
+		
+		// Top-N file metrics
+		for _, topFile := range stats.topFiles {
+			diskUsageTopFiles.WithLabelValues(topFile.path, fmt.Sprintf("%d", topFile.rank)).Set(float64(topFile.size))
+		}
+		
+		// Others metrics
+		if stats.othersTotal > 0 {
+			diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
+			diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
+		}
 	}
 }
 
