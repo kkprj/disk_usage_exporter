@@ -675,6 +675,15 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 		aggregationPath = filepath.Dir(path)
 	}
 	
+	// Check if we should collect statistics for this path/level combination
+	// For root path: only collect at level 0
+	// For non-root paths: collect at all levels
+	shouldCollect := (aggregationPath == rootPath && level == 0) || (aggregationPath != rootPath)
+	
+	if !shouldCollect {
+		return // Skip creating stats entirely for root path at level > 0
+	}
+	
 	// Initialize aggregated stats for this path/level if it doesn't exist
 	key := fmt.Sprintf("%s:%d", aggregationPath, level)
 	
@@ -691,31 +700,25 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	e.tempStatsMutex.Unlock()
 	
 	// Update directory-level statistics
-	// For root path: only collect at level 0
-	// For non-root paths: collect at all levels
-	shouldCollect := (aggregationPath == rootPath && level == 0) || (aggregationPath != rootPath)
+	stats.Lock()
+	stats.totalSize += item.GetUsage()
 	
-	if shouldCollect {
-		stats.Lock()
-		stats.totalSize += item.GetUsage()
-		
-		if item.IsDir() {
-			if e.collectDirCount {
-				stats.directoryCount++
-			}
-		} else {
-			// Process file metrics based on collection flags
-			if e.collectFileCount {
-				stats.fileCount++
-			}
-			
-			if e.collectSizeBucket {
-				sizeRange := getSizeRange(item.GetUsage())
-				stats.sizeBuckets[sizeRange]++
-			}
+	if item.IsDir() {
+		if e.collectDirCount {
+			stats.directoryCount++
 		}
-		stats.Unlock()
+	} else {
+		// Process file metrics based on collection flags
+		if e.collectFileCount {
+			stats.fileCount++
+		}
+		
+		if e.collectSizeBucket {
+			sizeRange := getSizeRange(item.GetUsage())
+			stats.sizeBuckets[sizeRange]++
+		}
 	}
+	stats.Unlock()
 
 	// Recursively process subdirectories
 	if item.IsDir() && level+1 <= maxLevel {
