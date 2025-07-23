@@ -35,7 +35,9 @@ Flags:
   -b, --bind-address string               Address to bind to (default "0.0.0.0:9995")
   -c, --config string                     config file (default is $HOME/.disk_usage_exporter.yaml)
   -l, --dir-level int                     Directory nesting level to show (0 = only selected dir) (default 2)
-      --dir-only                          Only analyze directories, exclude individual files from metrics
+      --dir-count                         Collect directory count metrics (default true)
+      --file-count                        Collect file count metrics (default true)
+      --size-bucket                       Collect size bucket metrics (default true)
   -L, --follow-symlinks                   Follow symlinks for files, i.e. show the size of the file to which symlink points to (symlinks to directories are not followed)
   -h, --help                              help for disk_usage_exporter
   -i, --ignore-dirs strings               Absolute paths to ignore (separated by comma) (default [/proc,/dev,/sys,/run,/var/cache/rsnapshot])
@@ -73,8 +75,8 @@ disk_usage_exporter --log-level debug --analyzed-path /tmp
 # Use 8 CPU cores for better performance
 disk_usage_exporter --max-procs 8 --analyzed-path /home
 
-# Directory-only mode (exclude individual files from metrics)
-disk_usage_exporter --dir-only --analyzed-path /home
+# Selective metric collection (collect only directory counts and size buckets)
+disk_usage_exporter --dir-count --no-file-count --size-bucket --analyzed-path /home
 
 # Environment variable configuration
 LOG_LEVEL=debug disk_usage_exporter --config config-basic.yml
@@ -151,12 +153,12 @@ The exporter provides **memory-efficient aggregated metrics** instead of individ
 ### Aggregated Metrics Structure
 
 ```prometheus
-# Directory-level aggregations
-# HELP node_disk_usage_directory_bytes Total disk usage by directory
-# TYPE node_disk_usage_directory_bytes gauge
-node_disk_usage_directory_bytes{level="0",path="/home"} 8.7081373696e+10
-node_disk_usage_directory_bytes{level="1",path="/home/user1"} 2.5e+10
-node_disk_usage_directory_bytes{level="1",path="/home/user2"} 1.2e+10
+# Total disk usage by directory
+# HELP node_disk_usage Total disk usage by directory
+# TYPE node_disk_usage gauge
+node_disk_usage{level="0",path="/home"} 8.7081373696e+10
+node_disk_usage{level="1",path="/home/user1"} 2.5e+10
+node_disk_usage{level="1",path="/home/user2"} 1.2e+10
 
 # File and directory counts
 # HELP node_disk_usage_file_count Number of files in directory
@@ -169,11 +171,7 @@ node_disk_usage_file_count{level="1",path="/home/user2"} 25000
 node_disk_usage_directory_count{level="1",path="/home/user1"} 150
 node_disk_usage_directory_count{level="1",path="/home/user2"} 75
 
-# Type-based aggregations
-# HELP node_disk_usage_by_type_bytes Disk usage aggregated by file type
-# TYPE node_disk_usage_by_type_bytes gauge
-node_disk_usage_by_type_bytes{level="1",path="/home/user1",type="file"} 2.0e+10
-node_disk_usage_by_type_bytes{level="1",path="/home/user1",type="directory"} 5.0e+09
+# This metric has been removed and replaced with node_disk_usage
 
 # Size-bucket distributions
 # HELP node_disk_usage_size_bucket File count by size range
@@ -223,7 +221,7 @@ Files are automatically categorized into size ranges:
 
 Total disk usage of `/home` directory and all subdirectories:
 ```promql
-sum(node_disk_usage_directory_bytes{path=~"/home.*"})
+sum(node_disk_usage{path=~"/home.*"})
 ```
 
 Total number of files in `/var` directory tree:
@@ -233,7 +231,7 @@ sum(node_disk_usage_file_count{path=~"/var.*"})
 
 Average directory size across all level-1 directories:
 ```promql
-avg(node_disk_usage_directory_bytes{level="1"})
+avg(node_disk_usage{level="1"})
 ```
 
 ### File Distribution Analysis
@@ -264,16 +262,16 @@ Total space used by top-N files vs others:
 sum(node_disk_usage_top_files) / (sum(node_disk_usage_top_files) + sum(node_disk_usage_others_total))
 ```
 
-### Type-based Analysis
+### Directory Usage Analysis
 
-Ratio of file space to directory overhead:
+Total disk usage across all monitored paths:
 ```promql
-node_disk_usage_by_type_bytes{type="file"} / node_disk_usage_by_type_bytes{type="directory"}
+sum(node_disk_usage)
 ```
 
-Total space used by files across all directories:
+Disk usage growth rate over time:
 ```promql
-sum(node_disk_usage_by_type_bytes{type="file"})
+rate(node_disk_usage[5m])
 ```
 
 ### Growth and Alert Queries
@@ -285,7 +283,7 @@ node_disk_usage_file_count > 100000
 
 Very large directories (>1TB) that might need cleanup:
 ```promql
-node_disk_usage_directory_bytes > 1e12
+node_disk_usage > 1e12
 ```
 
 Directories with unusually high file density:
@@ -314,9 +312,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: false
+# Selective metric collection configuration
+dir-count: true     # Collect directory count metrics
+file-count: true    # Collect file count metrics
+size-bucket: true   # Collect size bucket metrics
 
 ignore-dirs:
   - /proc
@@ -343,9 +342,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 8
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: false
+# Selective metric collection configuration
+dir-count: true     # Collect directory count metrics
+file-count: true    # Collect file count metrics
+size-bucket: true   # Collect size bucket metrics
 
 # Background caching configuration
 storage-path: "/tmp/disk-usage-cache"
@@ -375,9 +375,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 6
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: false
+# Selective metric collection configuration
+dir-count: true     # Collect directory count metrics
+file-count: true    # Collect file count metrics
+size-bucket: true   # Collect size bucket metrics
 
 multi-paths:
   /home: 2
@@ -417,9 +418,10 @@ log-level: "info"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: false
+# Selective metric collection configuration
+dir-count: true     # Collect directory count metrics
+file-count: true    # Collect file count metrics
+size-bucket: true   # Collect size bucket metrics
 
 ignore-dirs:
 - /proc
@@ -445,9 +447,10 @@ log-level: "debug"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 2
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: false
+# Selective metric collection configuration
+dir-count: true     # Collect directory count metrics
+file-count: true    # Collect file count metrics
+size-bucket: true   # Collect size bucket metrics
 
 # Background caching configuration
 storage-path: "/tmp/debug-cache"
@@ -720,73 +723,95 @@ time="2025-07-18T13:38:41+09:00" level=info msg="Memory usage: ~50MB (99% reduct
 ./disk_usage_exporter --max-procs 1 --analyzed-path /tmp
 ```
 
-## Directory-Only Mode
+## Selective Metric Collection
 
-The exporter supports a **directory-only mode** that excludes individual files from metrics collection, analyzing only directories. This is useful for:
+The exporter supports **selective metric collection** that allows you to choose which specific metrics to collect. This provides fine-grained control over resource usage and output:
 
-- **Ultra-low memory usage**: Further reduces memory footprint by excluding file-level statistics
-- **Directory structure analysis**: Focus on directory hierarchy without file-level details
-- **Performance optimization**: Faster analysis when file-level metrics are not needed
-- **Storage optimization**: Reduced metrics output for cleaner dashboards
+- **Granular Control**: Enable/disable individual metric types independently
+- **Resource Optimization**: Reduce memory and CPU usage by collecting only needed metrics
+- **Customized Monitoring**: Tailor metrics collection to specific use cases
+- **Performance Tuning**: Focus on specific aspects of filesystem analysis
 
-### Configuration
+### Configuration Options
 
-#### CLI Flag
+#### CLI Flags
 ```bash
-# Enable directory-only mode
-./disk_usage_exporter --dir-only --analyzed-path /home
+# Collect all metrics (default)
+./disk_usage_exporter --dir-count --file-count --size-bucket --analyzed-path /home
 
-# Disable directory-only mode (default)
-./disk_usage_exporter --analyzed-path /home
+# Collect only directory counts
+./disk_usage_exporter --dir-count --no-file-count --no-size-bucket --analyzed-path /home
+
+# Collect only size buckets for file distribution analysis
+./disk_usage_exporter --no-dir-count --no-file-count --size-bucket --analyzed-path /home
 ```
 
 #### Configuration File
 ```yaml
-# Enable directory-only mode
-dir-only: true
+# Enable/disable specific metrics collection
+dir-count: true      # Collect node_disk_usage_directory_count
+file-count: true     # Collect node_disk_usage_file_count  
+size-bucket: true    # Collect node_disk_usage_size_bucket
 
-# Disable directory-only mode (default)
-dir-only: false
+# All options default to true if not specified
 ```
 
 ### Metrics Behavior
 
-**With dir-only enabled (`dir-only: true`)**:
-- `node_disk_usage_file_count` shows 0 for all directories
-- `node_disk_usage_size_bucket` shows 0 for all size ranges
-- `node_disk_usage_top_files` is empty
-- `node_disk_usage_others_*` metrics show 0
-- `node_disk_usage_by_type_bytes{type="file"}` shows 0
-- Directory-level metrics work normally
+**With dir-count enabled (`dir-count: true`)**:
+- `node_disk_usage_directory_count` shows actual subdirectory counts
 
-**With dir-only disabled (`dir-only: false`, default)**:
-- All metrics include both files and directories
-- Complete analysis of the filesystem
+**With file-count enabled (`file-count: true`)**:
+- `node_disk_usage_file_count` shows actual file counts per directory
+
+**With size-bucket enabled (`size-bucket: true`)**:
+- `node_disk_usage_size_bucket` shows file distribution by size ranges
+
+**With metrics disabled**:
+- Corresponding metrics are not collected or published
+- Reduces memory usage and processing time
+- `node_disk_usage` (total disk usage) is always collected
 
 ### Example Use Cases
 
-**Directory structure monitoring**:
+**Directory structure monitoring only**:
 ```yaml
-# Monitor directory sizes without file details
+# Monitor only directory hierarchy
 analyzed-path: /mnt/storage
-dir-only: true
+dir-count: true
+file-count: false
+size-bucket: false
 dir-level: 3
 ```
 
-**Memory-constrained environments**:
+**File distribution analysis**:
 ```yaml
-# Minimal memory usage for large filesystems
+# Focus on file size distribution patterns
 analyzed-path: /home
-dir-only: true
+dir-count: false
+file-count: false
+size-bucket: true
 dir-level: 2
+```
+
+**Minimal resource usage**:
+```yaml
+# Collect only essential directory information
+analyzed-path: /var
+dir-count: true
+file-count: false
+size-bucket: false
+dir-level: 1
 max-procs: 2
 ```
 
-**Configuration management**:
+**Complete file analysis**:
 ```yaml
-# Monitor configuration directories without individual config files
-analyzed-path: /etc
-dir-only: true
+# Collect all available metrics (default behavior)
+analyzed-path: /home
+dir-count: true
+file-count: true
+size-bucket: true
 dir-level: 2
 ```
 

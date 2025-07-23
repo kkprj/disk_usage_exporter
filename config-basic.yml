@@ -16,9 +16,14 @@ log-level: "debug"
 # Maximum number of CPU cores to use for parallel processing
 max-procs: 4
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: true
+# Whether to collect node_disk_usage_directory_count
+dir-count: true
+
+# Whether to collect node_disk_usage_file_count
+file-count: true
+
+# Whether to collect node_disk_usage_size_bucket
+size-bucket: true
 
 # Directories to ignore during analysis
 ignore-dirs:

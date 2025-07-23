@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -20,13 +21,6 @@ import (
 
 var (
 	// 계층적 집계 메트릭
-	diskUsageDirectory = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "node_disk_usage_directory_bytes",
-			Help: "Total disk usage by directory",
-		},
-		[]string{"path", "level"},
-	)
 	diskUsageFileCount = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "node_disk_usage_file_count",
@@ -42,13 +36,13 @@ var (
 		[]string{"path", "level"},
 	)
 	
-	// 타입별 집계 메트릭
-	diskUsageByType = prometheus.NewGaugeVec(
+	// 디스크 사용량 메트릭
+	diskUsage = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "node_disk_usage_by_type_bytes",
-			Help: "Disk usage aggregated by file type",
+			Name: "node_disk_usage",
+			Help: "Total disk usage by directory",
 		},
-		[]string{"path", "type", "level"},
+		[]string{"path", "level"},
 	)
 	
 	// 크기별 버킷 메트릭
@@ -84,8 +78,8 @@ var (
 	)
 	
 	collectors = []prometheus.Collector{
-		diskUsageDirectory, diskUsageFileCount, diskUsageDirectoryCount,
-		diskUsageByType, diskUsageSizeBucket, diskUsageTopFiles,
+		diskUsageFileCount, diskUsageDirectoryCount,
+		diskUsage, diskUsageSizeBucket, diskUsageTopFiles,
 		diskUsageOthersTotal, diskUsageOthersCount,
 	}
 )
@@ -102,11 +96,9 @@ type aggregatedStats struct {
 	sync.Mutex
 	path           string
 	level          int
-	totalSize      int64
+	totalSize      int64             // total size for by_type metric
 	fileCount      int64
 	directoryCount int64
-	fileSize       int64
-	directorySize  int64
 	sizeBuckets    map[string]int64  // size_range -> count
 	topFiles       []topFileInfo     // largest files
 	othersTotal    int64
@@ -183,7 +175,9 @@ type Exporter struct {
 	stopChan       chan struct{}
 	useStorage     bool
 	maxProcs       int
-	dirOnly        bool
+	collectDirCount    bool
+	collectFileCount   bool
+	collectSizeBucket  bool
 	
 	// Sequential DB write components
 	sharedStorage  *analyze.Storage
@@ -240,9 +234,11 @@ func (e *Exporter) SetMaxProcs(maxProcs int) {
 	e.maxProcs = maxProcs
 }
 
-// SetDirOnly sets whether to analyze only directories or include files
-func (e *Exporter) SetDirOnly(dirOnly bool) {
-	e.dirOnly = dirOnly
+// SetCollectionFlags sets which metrics to collect
+func (e *Exporter) SetCollectionFlags(dirCount, fileCount, sizeBucket bool) {
+	e.collectDirCount = dirCount
+	e.collectFileCount = fileCount
+	e.collectSizeBucket = sizeBucket
 }
 
 // initializeSharedStorage initializes shared storage and starts writer goroutine
@@ -505,14 +501,13 @@ func (e *Exporter) provideEmptyMetrics() {
 	for path, level := range e.paths {
 		for i := 0; i <= level; i++ {
 			levelStr := fmt.Sprintf("%d", i)
-			diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-			diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
-			diskUsageByType.WithLabelValues(path, "directory", levelStr).Set(0)
 			
-			// Only provide file-related metrics if dir-only is disabled
-			if !e.dirOnly {
+			// Provide metrics based on collection flags
+			if e.collectDirCount {
+				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+			}
+			if e.collectFileCount {
 				diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
-				diskUsageByType.WithLabelValues(path, "file", levelStr).Set(0)
 			}
 		}
 	}
@@ -533,9 +528,10 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 					// Set zero values for metrics when analysis fails
 					for i := 0; i <= level; i++ {
 						levelStr := fmt.Sprintf("%d", i)
-						diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-						diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
-						if !e.dirOnly {
+						if e.collectDirCount {
+							diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+						}
+						if e.collectFileCount {
 							diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 						}
 					}
@@ -607,9 +603,10 @@ func (e *Exporter) loadFromStorage() {
 		for path, level := range e.paths {
 			for i := 0; i <= level; i++ {
 				levelStr := fmt.Sprintf("%d", i)
-				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
-				if !e.dirOnly {
+				if e.collectDirCount {
+					diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+				}
+				if e.collectFileCount {
 					diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 				}
 			}
@@ -625,9 +622,10 @@ func (e *Exporter) loadFromStorage() {
 			// Return empty metrics (0 bytes) for missing cache data
 			for i := 0; i <= level; i++ {
 				levelStr := fmt.Sprintf("%d", i)
-				diskUsageDirectory.WithLabelValues(path, levelStr).Set(0)
-				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
-				if !e.dirOnly {
+				if e.collectDirCount {
+					diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
+				}
+				if e.collectFileCount {
 					diskUsageFileCount.WithLabelValues(path, levelStr).Set(0)
 				}
 			}
@@ -665,18 +663,25 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 
 	path := item.GetPath()
 	
-	// Skip files entirely if dir-only mode is enabled
-	if e.dirOnly && !item.IsDir() {
+	// Skip files if no file-related metrics are needed
+	if !item.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
 		return
 	}
 	
+	// For files, use parent directory path for aggregation
+	aggregationPath := path
+	if !item.IsDir() {
+		// Get parent directory path for file aggregation
+		aggregationPath = filepath.Dir(path)
+	}
+	
 	// Initialize aggregated stats for this path/level if it doesn't exist
-	key := fmt.Sprintf("%s:%d", path, level)
+	key := fmt.Sprintf("%s:%d", aggregationPath, level)
 	
 	e.tempStatsMutex.Lock()
 	if e.tempStats[key] == nil {
 		e.tempStats[key] = &aggregatedStats{
-			path:        path,
+			path:        aggregationPath,
 			level:       level,
 			sizeBuckets: make(map[string]int64),
 			topFiles:    make([]topFileInfo, 0),
@@ -691,19 +696,19 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 		stats.totalSize += item.GetUsage()
 		
 		if item.IsDir() {
-			stats.directoryCount++
-			stats.directorySize += item.GetUsage()
-		} else if !e.dirOnly {
-			// Only process files if dir-only mode is disabled
-			stats.fileCount++
-			stats.fileSize += item.GetUsage()
+			if e.collectDirCount {
+				stats.directoryCount++
+			}
+		} else {
+			// Process file metrics based on collection flags
+			if e.collectFileCount {
+				stats.fileCount++
+			}
 			
-			// Update size buckets
-			sizeRange := getSizeRange(item.GetUsage())
-			stats.sizeBuckets[sizeRange]++
-			
-			// Track for top-N files (already locked)
-			e.updateTopFilesLocked(stats, path, item.GetUsage())
+			if e.collectSizeBucket {
+				sizeRange := getSizeRange(item.GetUsage())
+				stats.sizeBuckets[sizeRange]++
+			}
 		}
 		stats.Unlock()
 	}
@@ -776,36 +781,25 @@ func (e *Exporter) publishAggregatedMetrics() {
 		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
 		
-		// Directory-level metrics
-		diskUsageDirectory.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
-		diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
+		// Always publish total disk usage metric
+		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
 		
-		// File-related metrics - only publish if dir-only is disabled
-		if !e.dirOnly {
+		// Publish metrics based on collection flags
+		if e.collectDirCount {
+			diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
+		}
+		
+		if e.collectFileCount {
 			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
-			
-			// Type-based metrics for files
-			diskUsageByType.WithLabelValues(stats.path, "file", levelStr).Set(float64(stats.fileSize))
-			
-			// Size bucket metrics
+		}
+		
+		if e.collectSizeBucket {
 			for sizeRange, count := range stats.sizeBuckets {
 				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 			}
-			
-			// Top-N file metrics
-			for _, topFile := range stats.topFiles {
-				diskUsageTopFiles.WithLabelValues(topFile.path, fmt.Sprintf("%d", topFile.rank)).Set(float64(topFile.size))
-			}
-			
-			// Others metrics
-			if stats.othersTotal > 0 {
-				diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
-				diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
-			}
 		}
 		
-		// Directory type-based metrics (always published)
-		diskUsageByType.WithLabelValues(stats.path, "directory", levelStr).Set(float64(stats.directorySize))
+		// Total disk usage metric is published above
 		
 		stats.Unlock()
 	}

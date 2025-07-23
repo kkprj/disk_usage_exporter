@@ -22,9 +22,14 @@ multi-paths:
   /tmp: 1
   /opt: 2
 
-# Directory-only mode configuration
-# Only analyze directories, exclude individual files from metrics
-dir-only: true
+# Whether to collect node_disk_usage_directory_count
+dir-count: true
+
+# Whether to collect node_disk_usage_file_count
+file-count: true
+
+# Whether to collect node_disk_usage_size_bucket
+size-bucket: true
 
 # Background caching configuration (optional)
 storage-path: "/tmp/disk-usage-cache"
