@@ -693,7 +693,7 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	// Update directory-level statistics
 	// For root path: only collect at level 0
 	// For non-root paths: collect at all levels
-	shouldCollect := (path == rootPath && level == 0) || (path != rootPath)
+	shouldCollect := (aggregationPath == rootPath && level == 0) || (aggregationPath != rootPath)
 	
 	if shouldCollect {
 		stats.Lock()
