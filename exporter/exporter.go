@@ -691,7 +691,11 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	e.tempStatsMutex.Unlock()
 	
 	// Update directory-level statistics
-	if level == 0 || path != rootPath {
+	// For root path: only collect at level 0
+	// For non-root paths: collect at all levels
+	shouldCollect := (path == rootPath && level == 0) || (path != rootPath)
+	
+	if shouldCollect {
 		stats.Lock()
 		stats.totalSize += item.GetUsage()
 		
