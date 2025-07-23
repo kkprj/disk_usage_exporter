@@ -695,15 +695,11 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			stats.directorySize += item.GetUsage()
 		} else if !e.dirOnly {
 			// Only process files if dir-only mode is disabled
-			stats.fileCount++
-			stats.fileSize += item.GetUsage()
+			// Only collect size bucket data, skip file count, file size, and top files
 			
 			// Update size buckets
 			sizeRange := getSizeRange(item.GetUsage())
 			stats.sizeBuckets[sizeRange]++
-			
-			// Track for top-N files (already locked)
-			e.updateTopFilesLocked(stats, path, item.GetUsage())
 		}
 		stats.Unlock()
 	}
@@ -780,29 +776,13 @@ func (e *Exporter) publishAggregatedMetrics() {
 		diskUsageDirectory.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
 		diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
 		
-		// File-related metrics - only publish if dir-only is disabled
-		if !e.dirOnly {
-			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
-			
-			// Type-based metrics for files
-			diskUsageByType.WithLabelValues(stats.path, "file", levelStr).Set(float64(stats.fileSize))
-			
-			// Size bucket metrics
-			for sizeRange, count := range stats.sizeBuckets {
-				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
-			}
-			
-			// Top-N file metrics
-			for _, topFile := range stats.topFiles {
-				diskUsageTopFiles.WithLabelValues(topFile.path, fmt.Sprintf("%d", topFile.rank)).Set(float64(topFile.size))
-			}
-			
-			// Others metrics
-			if stats.othersTotal > 0 {
-				diskUsageOthersTotal.WithLabelValues(stats.path).Set(float64(stats.othersTotal))
-				diskUsageOthersCount.WithLabelValues(stats.path).Set(float64(stats.othersCount))
-			}
+		// Size bucket metrics (always published, even in dir-only mode)
+		for sizeRange, count := range stats.sizeBuckets {
+			diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 		}
+		
+		// File-related metrics are not published when dir-only is false
+		// Only size bucket metrics are collected and published
 		
 		// Directory type-based metrics (always published)
 		diskUsageByType.WithLabelValues(stats.path, "directory", levelStr).Set(float64(stats.directorySize))
