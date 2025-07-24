@@ -19,10 +19,10 @@ log-level: "debug"
 max-procs: 12
 
 # Whether to collect node_disk_usage_directory_count
-dir-count: true
+dir-count: false
 
 # Whether to collect node_disk_usage_file_count
-file-count: true
+file-count: false
 
 # Whether to collect node_disk_usage_size_bucket
 size-bucket: true
@@ -31,6 +31,9 @@ size-bucket: true
 # Both storage-path and scan-interval-minutes must be set to enable caching
 storage-path: "/tmp/disk-usage-cache"
 scan-interval-minutes: 1
+
+# if true, caching data to disk
+disk-caching: true
 
 # Directories to ignore during analysis
 ignore-dirs:

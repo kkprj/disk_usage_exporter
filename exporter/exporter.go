@@ -174,6 +174,7 @@ type Exporter struct {
 	mu             sync.RWMutex
 	stopChan       chan struct{}
 	useStorage     bool
+	diskCaching    bool
 	maxProcs       int
 	collectDirCount    bool
 	collectFileCount   bool
@@ -181,6 +182,7 @@ type Exporter struct {
 	
 	// Sequential DB write components
 	sharedStorage  *analyze.Storage
+	jsonStorage    JSONStorageInterface
 	storageMutex   sync.Mutex
 	writeQueue     chan writeRequest
 	writerDone     chan struct{}
@@ -215,15 +217,18 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	}
 }
 
-// SetStorageConfig sets storage path and scan interval in minutes
-func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int) {
+// SetStorageConfig sets storage path, scan interval in minutes, and disk caching flag
+func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int, diskCaching bool) {
 	e.storagePath = storagePath
 	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
 	e.useStorage = storagePath != "" && scanIntervalMinutes > 0
+	e.diskCaching = diskCaching
 	
-	// Skip storage initialization to prevent circular reference issues
-	// Only use memory cache for background scans
-	log.Infof("Storage writes disabled to prevent circular reference issues, using memory-only cache")
+	if diskCaching {
+		log.Infof("Disk caching enabled with BadgerDB + JSON storage at: %s", storagePath)
+	} else {
+		log.Infof("Disk caching disabled, using memory-only cache")
+	}
 }
 
 // SetMaxProcs sets the maximum number of CPU cores to use
@@ -246,14 +251,37 @@ func (e *Exporter) initializeSharedStorage() {
 	e.storageMutex.Lock()
 	defer e.storageMutex.Unlock()
 	
-	if e.sharedStorage == nil {
-		e.sharedStorage = analyze.NewStorage(e.storagePath, "")
-		if e.sharedStorage != nil {
-			closeFn := e.sharedStorage.Open()
-			if closeFn != nil {
-				e.storageCloseFn = closeFn
-				// Start writer goroutine
-				go e.runStorageWriter()
+	// Use JSON storage when disk caching is enabled
+	if e.diskCaching && e.storagePath != "" {
+		if e.jsonStorage == nil {
+			e.jsonStorage = NewJSONStorage(e.storagePath)
+			closeFn, err := e.jsonStorage.Open()
+			if err != nil {
+				log.Warnf("Failed to open JSON storage at %s: %v, falling back to memory-only mode", e.storagePath, err)
+				e.jsonStorage = nil
+				e.diskCaching = false
+				return
+			}
+			e.storageCloseFn = closeFn
+			log.Infof("JSON storage initialized successfully at: %s", e.storagePath)
+			
+			// Load existing data from storage
+			e.loadExistingDataFromStorage()
+			
+			// Start writer goroutine
+			go e.runStorageWriter()
+		}
+	} else {
+		// Fallback to original gob-based storage for backward compatibility
+		if e.sharedStorage == nil && e.useStorage {
+			e.sharedStorage = analyze.NewStorage(e.storagePath, "")
+			if e.sharedStorage != nil {
+				closeFn := e.sharedStorage.Open()
+				if closeFn != nil {
+					e.storageCloseFn = closeFn
+					// Start writer goroutine
+					go e.runStorageWriter()
+				}
 			}
 		}
 	}
@@ -281,12 +309,50 @@ func (e *Exporter) writeToStorage(path string, result fs.Item) error {
 	e.storageMutex.Lock()
 	defer e.storageMutex.Unlock()
 	
-	if e.sharedStorage == nil {
-		return fmt.Errorf("shared storage not initialized")
+	// Use JSON storage if disk caching is enabled
+	if e.diskCaching && e.jsonStorage != nil {
+		return e.jsonStorage.StoreDir(path, result)
 	}
 	
-	// Store the result in BadgerDB
-	return e.sharedStorage.StoreDir(result)
+	// Fallback to gob storage for backward compatibility
+	if e.sharedStorage != nil {
+		return e.sharedStorage.StoreDir(result)
+	}
+	
+	return fmt.Errorf("no storage backend initialized")
+}
+
+// loadExistingDataFromStorage loads cached data from JSON storage on startup
+func (e *Exporter) loadExistingDataFromStorage() {
+	if e.jsonStorage == nil || !e.jsonStorage.IsOpen() {
+		return
+	}
+	
+	// Initialize cached results map if needed
+	if e.cachedResults == nil {
+		e.cachedResults = make(map[string]fs.Item)
+	}
+	
+	// Attempt to load data for each configured path
+	loadedCount := 0
+	for path := range e.paths {
+		if item, err := e.jsonStorage.LoadDir(path); err == nil && item != nil {
+			e.cachedResults[path] = item
+			loadedCount++
+			log.Debugf("Loaded cached data from storage for path: %s", path)
+		} else {
+			log.Debugf("No cached data found in storage for path: %s (this is normal for first run)", path)
+		}
+	}
+	
+	if loadedCount > 0 {
+		log.Infof("Successfully loaded cached data from JSON storage for %d out of %d paths", loadedCount, len(e.paths))
+		// Update last scan time to indicate we have valid data
+		e.lastScanTime = time.Now()
+		e.setValidResults(true)
+	} else {
+		log.Info("No cached data found in JSON storage - will perform fresh scan")
+	}
 }
 
 // queueStorageWrite queues a write request for sequential processing
@@ -429,9 +495,11 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
-		// Skip storage writes to prevent circular reference issues
-		// Storage writes cause stack overflow due to gob serialization of fs.Item
-		// Memory cache is sufficient for HTTP requests
+		// Queue storage write if disk caching is enabled
+		// JSON storage avoids the circular reference issues that occurred with gob
+		if e.diskCaching && e.jsonStorage != nil {
+			e.queueStorageWrite(result.path, result.result)
+		}
 		
 		// Log scan completion time with goroutine stats
 		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", result.path, result.elapsed, runtime.NumGoroutine())
@@ -453,6 +521,11 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 		e.cachedResults[path] = dir
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
+		
+		// Queue storage write if disk caching is enabled
+		if e.diskCaching && e.jsonStorage != nil {
+			e.queueStorageWrite(path, dir)
+		}
 		
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
@@ -877,6 +950,8 @@ func (e *Exporter) authorizeReq(w http.ResponseWriter, req *http.Request) bool {
 // StartBackgroundScan starts the background scanning goroutine
 func (e *Exporter) StartBackgroundScan() {
 	if e.storagePath != "" && e.scanInterval > 0 {
+		// Initialize storage before starting background scan
+		e.initializeSharedStorage()
 		go e.runBackgroundScan()
 		log.Printf("Background scan started with interval: %v", e.scanInterval)
 	}
@@ -887,7 +962,7 @@ func (e *Exporter) Stop() {
 	close(e.stopChan)
 	
 	// Wait for writer goroutine to finish if it was started
-	if e.useStorage && e.writerDone != nil {
+	if (e.useStorage || e.diskCaching) && e.writerDone != nil {
 		<-e.writerDone
 	}
 	
@@ -906,6 +981,12 @@ func (e *Exporter) Stop() {
 	e.cachedResults = nil
 	e.storage = nil
 	e.sharedStorage = nil
+	
+	// Clean up JSON storage
+	if e.jsonStorage != nil {
+		e.jsonStorage.Close()
+		e.jsonStorage = nil
+	}
 }
 
 // RunServer starts HTTP server loop

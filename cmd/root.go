@@ -79,7 +79,7 @@ and reporting which directories consume what space.`,
 
 		// Configure storage and scan interval if specified
 		if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
-			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"))
+			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"), viper.GetBool("disk-caching"))
 		}
 		
 		// Configure max processors
@@ -125,6 +125,7 @@ func init() {
 	flags.StringToString("basic-auth-users", map[string]string{}, "Basic Auth users and their passwords as bcypt hashes")
 	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
 	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
+	flags.Bool("disk-caching", false, "Enable disk caching with BadgerDB + JSON storage")
 	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
 	flags.IntP("max-procs", "j", 4, "Maximum number of CPU cores to use for parallel processing")
 
