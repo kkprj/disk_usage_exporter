@@ -312,6 +312,21 @@ func (e *Exporter) writeToStorage(path string, result fs.Item) error {
 	
 	// Use JSON storage if disk caching is enabled
 	if e.diskCaching && e.jsonStorage != nil {
+		// Get the dir-level for this path to limit caching depth
+		maxLevel := e.paths[path]
+		if maxLevel < 0 {
+			maxLevel = 0 // Default to level 0 if not found
+		}
+		
+		// Use level-based caching to optimize storage size
+		if jsonStorageWithLevel, ok := e.jsonStorage.(interface {
+			StoreDirWithLevel(string, fs.Item, int) error
+		}); ok {
+			log.Debugf("Storing with level limit %d for path: %s", maxLevel, path)
+			return jsonStorageWithLevel.StoreDirWithLevel(path, result, maxLevel)
+		}
+		
+		// Fallback to regular storage if StoreDirWithLevel is not available
 		return e.jsonStorage.StoreDir(path, result)
 	}
 	
@@ -337,7 +352,26 @@ func (e *Exporter) loadExistingDataFromStorage() {
 	// Attempt to load data for each configured path
 	loadedCount := 0
 	for path := range e.paths {
-		if item, err := e.jsonStorage.LoadDir(path); err == nil && item != nil {
+		// Get the dir-level for this path to load only necessary data
+		maxLevel := e.paths[path]
+		if maxLevel < 0 {
+			maxLevel = 0 // Default to level 0 if not found
+		}
+		
+		// Try to load with level filtering if available
+		var item fs.Item
+		var err error
+		if jsonStorageWithLevel, ok := e.jsonStorage.(interface {
+			LoadDirWithLevel(string, int) (fs.Item, error)
+		}); ok {
+			log.Debugf("Loading with level limit %d for path: %s", maxLevel, path)
+			item, err = jsonStorageWithLevel.LoadDirWithLevel(path, maxLevel)
+		} else {
+			// Fallback to regular loading
+			item, err = e.jsonStorage.LoadDir(path)
+		}
+		
+		if err == nil && item != nil {
 			// Convert loaded fs.Item to lightweight aggregated stats
 			e.convertToAggregatedStats(path, item)
 			loadedCount++

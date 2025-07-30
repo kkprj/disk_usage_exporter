@@ -127,7 +127,13 @@ func (js *JSONStorage) IsOpen() bool {
 }
 
 // StoreDir stores a directory item in JSON format
+// Only stores directories up to the specified dir-level to optimize cache size
 func (js *JSONStorage) StoreDir(path string, item fs.Item) error {
+	return js.StoreDirWithLevel(path, item, -1) // Default: no level limit for backward compatibility
+}
+
+// StoreDirWithLevel stores a directory item with level-based filtering
+func (js *JSONStorage) StoreDirWithLevel(path string, item fs.Item, maxLevel int) error {
 	if err := js.checkCount(); err != nil {
 		return err
 	}
@@ -139,6 +145,22 @@ func (js *JSONStorage) StoreDir(path string, item fs.Item) error {
 		return fmt.Errorf("database is not open")
 	}
 
+	if item == nil {
+		log.Warnf("Attempted to store nil item for path: %s", path)
+		return fmt.Errorf("item cannot be nil")
+	}
+
+	// Store the item with level filtering
+	return js.storeDirRecursive(path, item, 0, maxLevel)
+}
+
+// storeDirRecursive recursively stores directories up to maxLevel
+func (js *JSONStorage) storeDirRecursive(path string, item fs.Item, currentLevel, maxLevel int) error {
+	// Skip if we've exceeded the maximum level (unless maxLevel is -1 for no limit)
+	if maxLevel >= 0 && currentLevel > maxLevel {
+		return nil
+	}
+
 	// OPTIMIZATION: Store lightweight aggregated stats instead of full fs.Item
 	// This dramatically reduces storage size and memory usage
 
@@ -147,6 +169,7 @@ func (js *JSONStorage) StoreDir(path string, item fs.Item) error {
 	stats["path"] = path
 	stats["total_size"] = item.GetUsage()
 	stats["stored_at"] = time.Now().Unix()
+	stats["level"] = currentLevel
 
 	// Only store what's actually needed based on collection flags
 	// Since we don't have access to Exporter here, we store minimal data
@@ -166,19 +189,46 @@ func (js *JSONStorage) StoreDir(path string, item fs.Item) error {
 		return fmt.Errorf("failed to marshal lightweight stats: %w", err)
 	}
 
-	// Store in BadgerDB
-	return js.db.Update(func(txn *badger.Txn) error {
-		key := []byte(path + ":stats") // Use different key to avoid conflicts
+	// Store in BadgerDB with level-specific key
+	err = js.db.Update(func(txn *badger.Txn) error {
+		key := []byte(fmt.Sprintf("%s:level:%d:stats", path, currentLevel))
 		if err := txn.Set(key, jsonData); err != nil {
 			return fmt.Errorf("failed to store in BadgerDB: %w", err)
 		}
-		log.Debugf("Stored lightweight stats for path: %s (size: %d bytes)", path, len(jsonData))
+		log.Debugf("Stored lightweight stats for path: %s (level: %d, size: %d bytes)", path, currentLevel, len(jsonData))
 		return nil
 	})
+	
+	if err != nil {
+		return err
+	}
+
+	// Recursively store subdirectories if within level limit
+	if item.IsDir() && (maxLevel == -1 || currentLevel < maxLevel) {
+		files := item.GetFiles()
+		if files != nil {
+			for _, subItem := range files {
+				if subItem != nil && subItem.IsDir() {
+					subPath := subItem.GetPath()
+					if err := js.storeDirRecursive(subPath, subItem, currentLevel+1, maxLevel); err != nil {
+						log.Warnf("Failed to store subdirectory %s at level %d: %v", subPath, currentLevel+1, err)
+						// Continue with other subdirectories instead of failing completely
+					}
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // LoadDir loads a directory item from JSON format
 func (js *JSONStorage) LoadDir(path string) (fs.Item, error) {
+	return js.LoadDirWithLevel(path, -1) // Default: no level limit for backward compatibility
+}
+
+// LoadDirWithLevel loads a directory item with level filtering
+func (js *JSONStorage) LoadDirWithLevel(path string, maxLevel int) (fs.Item, error) {
 	if err := js.checkCount(); err != nil {
 		return nil, err
 	}
@@ -190,7 +240,12 @@ func (js *JSONStorage) LoadDir(path string) (fs.Item, error) {
 		return nil, fmt.Errorf("database is not open")
 	}
 
-	// OPTIMIZATION: Try to load lightweight stats first
+	// Try to load level-specific data first (new format)
+	if maxLevel >= 0 {
+		return js.loadLevelBasedData(path, maxLevel)
+	}
+
+	// OPTIMIZATION: Try to load lightweight stats first (legacy format)
 	var jsonData []byte
 	err := js.db.View(func(txn *badger.Txn) error {
 		// Try lightweight stats key first
@@ -236,6 +291,92 @@ func (js *JSONStorage) LoadDir(path string) (fs.Item, error) {
 	}
 
 	log.Debugf("Loaded directory data for path: %s (format: legacy)", path)
+	return fsItem, nil
+}
+
+// loadLevelBasedData loads level-specific cached data
+func (js *JSONStorage) loadLevelBasedData(path string, maxLevel int) (fs.Item, error) {
+	// Try to load data for level 0 (root level)
+	var jsonData []byte
+	levelKey := fmt.Sprintf("%s:level:0:stats", path)
+	
+	err := js.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(levelKey))
+		if err != nil {
+			return fmt.Errorf("failed to read level-based data from BadgerDB: %w", err)
+		}
+
+		return item.Value(func(val []byte) error {
+			jsonData = make([]byte, len(val))
+			copy(jsonData, val)
+			return nil
+		})
+	})
+
+	if err != nil {
+		// If level-based data doesn't exist, fall back to legacy format
+		log.Debugf("Level-based data not found for path: %s, falling back to legacy format", path)
+		return js.loadLegacyFormat(path)
+	}
+
+	// Unmarshal level-specific stats
+	var stats map[string]interface{}
+	if err := json.Unmarshal(jsonData, &stats); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal level-based stats: %w", err)
+	}
+
+	// Create minimal item from level-specific stats
+	item := js.createMinimalItemFromStats(stats)
+	log.Debugf("Loaded level-based data for path: %s (max level: %d)", path, maxLevel)
+	return item, nil
+}
+
+// loadLegacyFormat loads data using the legacy format
+func (js *JSONStorage) loadLegacyFormat(path string) (fs.Item, error) {
+	var jsonData []byte
+	err := js.db.View(func(txn *badger.Txn) error {
+		// Try lightweight stats key first
+		item, err := txn.Get([]byte(path + ":stats"))
+		if err != nil {
+			// Fallback to old format for backward compatibility
+			item, err = txn.Get([]byte(path))
+			if err != nil {
+				return fmt.Errorf("failed to read from BadgerDB: %w", err)
+			}
+		}
+
+		return item.Value(func(val []byte) error {
+			jsonData = make([]byte, len(val))
+			copy(jsonData, val)
+			return nil
+		})
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to unmarshal as lightweight stats first
+	var stats map[string]interface{}
+	if err := json.Unmarshal(jsonData, &stats); err == nil {
+		if _, hasPath := stats["path"]; hasPath {
+			// This is lightweight stats format
+			return js.createMinimalItemFromStats(stats), nil
+		}
+	}
+
+	// Fallback to old format for backward compatibility
+	var jsonItem JSONItem
+	if err := json.Unmarshal(jsonData, &jsonItem); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	// Convert JSONItem back to fs.Item
+	fsItem, err := js.convertFromJSONItem(&jsonItem, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert from JSON item: %w", err)
+	}
+
 	return fsItem, nil
 }
 
