@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/dundee/disk_usage_exporter/build"
 	"github.com/dundee/disk_usage_exporter/exporter"
@@ -19,6 +20,43 @@ import (
 var (
 	cfgFile string
 )
+
+// CustomFormatter implements the requested log format
+// Format: [timestamp][LEVEL][filename:function:line] message
+type CustomFormatter struct{}
+
+func (f *CustomFormatter) Format(entry *log.Entry) ([]byte, error) {
+	// Format timestamp
+	timestamp := entry.Time.Format("2006-01-02 15:04:05")
+	
+	// Format log level (uppercase, 4 characters)
+	level := strings.ToUpper(entry.Level.String())
+	if len(level) > 4 {
+		level = level[:4]
+	}
+	
+	// Extract caller information
+	filename := "unknown"
+	functionName := "unknown"
+	line := 0
+	
+	if entry.HasCaller() {
+		filename = filepath.Base(entry.Caller.File)
+		// Extract function name (remove package path)
+		fullFunc := entry.Caller.Function
+		parts := strings.Split(fullFunc, ".")
+		if len(parts) > 0 {
+			functionName = parts[len(parts)-1]
+		}
+		line = entry.Caller.Line
+	}
+	
+	// Format: [timestamp][LEVEL][filename:function:line] message
+	msg := fmt.Sprintf("[%s][%s][%s:%s:%d] %s\n",
+		timestamp, level, filename, functionName, line, entry.Message)
+	
+	return []byte(msg), nil
+}
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
@@ -49,11 +87,11 @@ and reporting which directories consume what space.`,
 			log.SetLevel(log.InfoLevel)
 		}
 		
-		// Set log formatter to include timestamps
-		log.SetFormatter(&log.TextFormatter{
-			TimestampFormat: "2006-01-02 15:04:05",
-			FullTimestamp:   true,
-		})
+		// Set custom log formatter with requested format
+		log.SetFormatter(&CustomFormatter{})
+		
+		// Enable caller reporting to show file, function, and line info
+		log.SetReportCaller(true)
 
 		printHeader()
 
