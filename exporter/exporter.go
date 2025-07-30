@@ -169,7 +169,7 @@ type Exporter struct {
 	scanInterval   time.Duration
 	storage        *analyze.Storage
 	storageCloseFn func()
-	cachedResults  map[string]fs.Item
+	cachedStats    map[string]map[string]*aggregatedStats // path -> level:stats
 	lastScanTime   time.Time
 	mu             sync.RWMutex
 	stopChan       chan struct{}
@@ -213,7 +213,8 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 		writerDone:      make(chan struct{}),
 		aggregatedStats: make(map[string]*aggregatedStats),
 		tempStats:       make(map[string]*aggregatedStats),
-		topNLimit:       1000, // Track top 1000 largest files
+		cachedStats:     make(map[string]map[string]*aggregatedStats),
+		topNLimit:       1000, // Track top 1000 largest files (only if needed)
 	}
 }
 
@@ -328,18 +329,19 @@ func (e *Exporter) loadExistingDataFromStorage() {
 		return
 	}
 	
-	// Initialize cached results map if needed
-	if e.cachedResults == nil {
-		e.cachedResults = make(map[string]fs.Item)
+	// Initialize cached stats map if needed
+	if e.cachedStats == nil {
+		e.cachedStats = make(map[string]map[string]*aggregatedStats)
 	}
 	
 	// Attempt to load data for each configured path
 	loadedCount := 0
 	for path := range e.paths {
 		if item, err := e.jsonStorage.LoadDir(path); err == nil && item != nil {
-			e.cachedResults[path] = item
+			// Convert loaded fs.Item to lightweight aggregated stats
+			e.convertToAggregatedStats(path, item)
 			loadedCount++
-			log.Debugf("Loaded cached data from storage for path: %s", path)
+			log.Debugf("Loaded and converted cached data from storage for path: %s", path)
 		} else {
 			log.Debugf("No cached data found in storage for path: %s (this is normal for first run)", path)
 		}
@@ -416,10 +418,10 @@ func (e *Exporter) performScan() {
 		e.performAnalysisWithRegular(analyzer)
 	}
 
-	// Initialize cached results map
+	// Initialize cached stats map
 	e.mu.Lock()
-	if e.cachedResults == nil {
-		e.cachedResults = make(map[string]fs.Item)
+	if e.cachedStats == nil {
+		e.cachedStats = make(map[string]map[string]*aggregatedStats)
 	}
 	e.mu.Unlock()
 
@@ -486,12 +488,13 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 	
 	// Process results and queue for sequential DB writes
 	for result := range resultChan {
-		// Store results in memory cache immediately
+		// Convert and store results in lightweight stats cache
 		e.mu.Lock()
-		if e.cachedResults == nil {
-			e.cachedResults = make(map[string]fs.Item)
+		if e.cachedStats == nil {
+			e.cachedStats = make(map[string]map[string]*aggregatedStats)
 		}
-		e.cachedResults[result.path] = result.result
+		// Convert fs.Item to aggregated stats to save memory
+		e.convertToAggregatedStats(result.path, result.result)
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
@@ -516,9 +519,9 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		
-		// Store results in memory cache 
+		// Convert and store results in lightweight stats cache
 		e.mu.Lock()
-		e.cachedResults[path] = dir
+		e.convertToAggregatedStats(path, dir)
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
@@ -668,8 +671,8 @@ func (e *Exporter) loadFromStorage() {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Check if we have cached results in memory
-	if e.cachedResults == nil {
+	// Check if we have cached stats in memory
+	if e.cachedStats == nil {
 		log.Debugf("No cached data available, returning empty metrics - storagePath: %s, scanInterval: %v, scanPaths: %v, followSymlinks: %v",
 			e.storagePath, e.scanInterval, e.paths, e.followSymlinks)
 		// Return empty metrics for all paths
@@ -688,8 +691,8 @@ func (e *Exporter) loadFromStorage() {
 	}
 
 	for path, level := range e.paths {
-		dir, exists := e.cachedResults[path]
-		if !exists || dir == nil {
+		pathStats, exists := e.cachedStats[path]
+		if !exists || pathStats == nil {
 			log.Debugf("No cached data found for path: %s, returning empty metrics - storagePath: %s, scanInterval: %v, followSymlinks: %v",
 				path, e.storagePath, e.scanInterval, e.followSymlinks)
 			// Return empty metrics (0 bytes) for missing cache data
@@ -704,7 +707,8 @@ func (e *Exporter) loadFromStorage() {
 			}
 			continue
 		}
-		e.analyzeAndAggregate(dir, 0, level, path)
+		// Use cached aggregated stats directly
+		e.publishCachedStats(pathStats)
 	}
 }
 
@@ -736,9 +740,22 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 
 	path := item.GetPath()
 	
+	// Log directory scanning progress by level
+	if item.IsDir() {
+		log.Debugf("[Level %d] Scanning directory: %s (files: %d)", level, path, len(item.GetFiles()))
+	}
+	
 	// Skip files if no file-related metrics are needed
 	if !item.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
 		return
+	}
+	
+	// Skip directories if no directory-related metrics are needed - NEW OPTIMIZATION
+	if item.IsDir() && !e.collectDirCount && level > 0 {
+		// Still need to recurse for size-bucket collection from files
+		if !e.collectSizeBucket {
+			return
+		}
 	}
 	
 	// For files, use parent directory path for aggregation
@@ -765,8 +782,15 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 		e.tempStats[key] = &aggregatedStats{
 			path:        aggregationPath,
 			level:       level,
-			sizeBuckets: make(map[string]int64),
-			topFiles:    make([]topFileInfo, 0),
+			// Only initialize sizeBuckets if needed
+			sizeBuckets: func() map[string]int64 {
+				if e.collectSizeBucket {
+					return make(map[string]int64)
+				}
+				return nil
+			}(),
+			// Don't initialize topFiles if not needed
+			topFiles:    nil, // Optimize: only create when actually needed
 		}
 	}
 	stats := e.tempStats[key]
@@ -774,21 +798,26 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	
 	// Update directory-level statistics
 	stats.Lock()
+	// Always collect total size for node_disk_usage metric
 	stats.totalSize += item.GetUsage()
 	
 	if item.IsDir() {
+		// Only increment directory count if flag is enabled
 		if e.collectDirCount {
 			stats.directoryCount++
 		}
+		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", level, path, item.GetUsage())
 	} else {
 		// Process file metrics based on collection flags
 		if e.collectFileCount {
 			stats.fileCount++
 		}
 		
-		if e.collectSizeBucket {
+		// Only process size buckets if enabled and sizeBuckets map exists
+		if e.collectSizeBucket && stats.sizeBuckets != nil {
 			sizeRange := getSizeRange(item.GetUsage())
 			stats.sizeBuckets[sizeRange]++
+			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", level, path, item.GetUsage(), sizeRange)
 		}
 	}
 	stats.Unlock()
@@ -805,51 +834,105 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			
 			files := item.GetFiles()
 			if files == nil {
-				log.Debugf("No files found for directory: %s", path)
+				log.Debugf("[Level %d] No files found for directory: %s", level, path)
 				return
 			}
 			
+			log.Debugf("[Level %d] Processing %d entries in directory: %s", level, len(files), path)
+			
+			// OPTIMIZATION: Only process entries if we need the data
+			processedCount := 0
 			for _, entry := range files {
 				if entry == nil {
 					continue
 				}
+				
+				// Skip processing if no relevant metrics needed for this entry type
+				if entry.IsDir() && !e.collectDirCount && level+1 > maxLevel {
+					continue
+				}
+				if !entry.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
+					continue
+				}
+				
 				e.collectAggregatedStats(entry, level+1, maxLevel, rootPath)
+				processedCount++
 			}
+			
+			log.Debugf("[Level %d] Completed directory: %s (processed: %d/%d entries)", level, path, processedCount, len(files))
 		}()
 	}
 }
 
-// updateTopFilesLocked maintains the top-N largest files list (assumes stats is already locked)
-func (e *Exporter) updateTopFilesLocked(stats *aggregatedStats, path string, size int64) {
-	if len(stats.topFiles) < e.topNLimit {
-		stats.topFiles = append(stats.topFiles, topFileInfo{
-			path: path,
-			size: size,
-			rank: len(stats.topFiles) + 1,
-		})
-	} else {
-		// Find smallest in top-N and replace if current is larger
-		minIdx := 0
-		minSize := stats.topFiles[0].size
-		for i, file := range stats.topFiles {
-			if file.size < minSize {
-				minIdx = i
-				minSize = file.size
+// convertToAggregatedStats converts fs.Item to lightweight aggregated stats
+func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
+	if item == nil {
+		return
+	}
+	
+	level := e.paths[rootPath]
+	if level < 0 {
+		level = 0
+	}
+	
+	// Initialize path stats if needed
+	if e.cachedStats[rootPath] == nil {
+		e.cachedStats[rootPath] = make(map[string]*aggregatedStats)
+	}
+	
+	// Clear existing stats and regenerate from fs.Item
+	e.tempStatsMutex.Lock()
+	e.tempStats = make(map[string]*aggregatedStats)
+	e.tempStatsMutex.Unlock()
+	
+	// Collect stats from the fs.Item structure
+	e.collectAggregatedStats(item, 0, level, rootPath)
+	
+	// Copy temp stats to cached stats
+	e.tempStatsMutex.Lock()
+	for key, stats := range e.tempStats {
+		e.cachedStats[rootPath][key] = stats
+	}
+	e.tempStats = make(map[string]*aggregatedStats)
+	e.tempStatsMutex.Unlock()
+	
+	log.Debugf("Converted fs.Item to lightweight stats for path: %s (stats count: %d)", rootPath, len(e.cachedStats[rootPath]))
+}
+
+// publishCachedStats publishes cached aggregated stats to Prometheus
+func (e *Exporter) publishCachedStats(pathStats map[string]*aggregatedStats) {
+	for _, stats := range pathStats {
+		stats.Lock()
+		levelStr := fmt.Sprintf("%d", stats.level)
+		
+		// Always publish total disk usage metric
+		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
+		
+		// Publish metrics based on collection flags
+		if e.collectDirCount {
+			diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
+		}
+		
+		if e.collectFileCount {
+			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
+		}
+		
+		if e.collectSizeBucket && stats.sizeBuckets != nil {
+			for sizeRange, count := range stats.sizeBuckets {
+				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 			}
 		}
 		
-		if size > minSize {
-			stats.topFiles[minIdx] = topFileInfo{
-				path: path,
-				size: size,
-				rank: minIdx + 1,
-			}
-		} else {
-			// Add to others total
-			stats.othersTotal += size
-			stats.othersCount++
-		}
+		stats.Unlock()
 	}
+}
+
+// updateTopFilesLocked maintains the top-N largest files list (assumes stats is already locked) - UNUSED
+// This method is currently unused due to memory optimization
+func (e *Exporter) updateTopFilesLocked(stats *aggregatedStats, path string, size int64) {
+	// This method is disabled for memory optimization
+	// Top-N file tracking is memory intensive and disabled when only size-bucket is needed
+	return
 }
 
 // publishAggregatedMetrics publishes all aggregated metrics to Prometheus
@@ -975,10 +1058,10 @@ func (e *Exporter) Stop() {
 		e.storageCloseFn()
 	}
 	
-	// Clean up cached results
+	// Clean up cached stats
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.cachedResults = nil
+	e.cachedStats = nil
 	e.storage = nil
 	e.sharedStorage = nil
 	
