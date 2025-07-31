@@ -180,9 +180,9 @@ func newStreamingProcessor(exporter *Exporter, rootPath string, maxLevel int) *s
 func (sp *streamingProcessor) processDirectoryStreaming() error {
 	log.Debugf("Starting streaming analysis for path: %s (maxLevel: %d)", sp.rootPath, sp.maxLevel)
 	defer func() {
-		// Force cleanup of current batch and stats
+		// Force cleanup of current batch only
+		// Stats will be transferred via getStreamingStats
 		sp.currentBatch = nil
-		sp.stats = nil
 		runtime.GC()
 		log.Debugf("Completed streaming analysis for path: %s", sp.rootPath)
 	}()
@@ -290,7 +290,7 @@ func (sp *streamingProcessor) processBatch() {
 		return
 	}
 
-	log.Tracef("Processing batch of %d items", len(sp.currentBatch))
+	log.Debugf("Processing batch of %d items", len(sp.currentBatch))
 
 	// Process each item in the batch
 	for _, item := range sp.currentBatch {
@@ -312,17 +312,17 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 		aggregationPath = filepath.Dir(item.path)
 	}
 
-	// Skip root path at levels > 0 to avoid duplicate counting
-	if aggregationPath == sp.rootPath && item.level > 0 {
-		return
-	}
+	// Process all items - let the level-based aggregation handle duplicates
+	// Only skip if this would create infinite recursion (which shouldn't happen in streaming)
 
 	// Create stats key
 	key := fmt.Sprintf("%s:%d", aggregationPath, item.level)
+	log.Debugf("Creating stats key: %s for item: %s", key, item.path)
 
 	// Get or create stats for this path/level
 	sp.statsMutex.Lock()
 	if sp.stats[key] == nil {
+		log.Debugf("Creating new stats for key: %s", key)
 		sp.stats[key] = &aggregatedStats{
 			path:  aggregationPath,
 			level: item.level,
@@ -334,6 +334,8 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 				return nil
 			}(),
 		}
+	} else {
+		log.Debugf("Using existing stats for key: %s", key)
 	}
 	stats := sp.stats[key]
 	sp.statsMutex.Unlock()
@@ -344,6 +346,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 
 	// Always collect total size
 	stats.totalSize += item.size
+	log.Debugf("Aggregated item: %s (size: %d, level: %d, isDir: %t)", item.path, item.size, item.level, item.isDir)
 
 	if item.isDir {
 		// Only increment directory count if flag is enabled
@@ -374,6 +377,10 @@ func (sp *streamingProcessor) getStreamingStats() map[string]*aggregatedStats {
 
 	// Transfer ownership of stats map
 	result := sp.stats
+	log.Debugf("Before transfer: stats map has %d entries", len(result))
+	for key, stats := range result {
+		log.Debugf("Stats entry: %s -> size=%d, level=%d", key, stats.totalSize, stats.level)
+	}
 	sp.stats = make(map[string]*aggregatedStats) // Create new empty map
 
 	log.Debugf("Transferred %d aggregated stats from streaming processor", len(result))
@@ -794,6 +801,18 @@ func (e *Exporter) performStreamingAnalysis() {
 		log.Infof("Streaming scan completed for path: %s, stats: %d, workers: %d", 
 			path, len(result.stats), e.maxProcs)
 	}
+	
+	// Transfer cached stats to aggregated stats for metric publishing
+	e.statsMutex.Lock()
+	for _, pathStats := range pathResults {
+		for statsKey, stats := range pathStats.stats {
+			e.aggregatedStats[statsKey] = stats
+		}
+	}
+	e.statsMutex.Unlock()
+	
+	// Publish aggregated metrics
+	e.publishAggregatedMetrics()
 	
 	// Update results validity
 	e.setValidResults(true)
