@@ -2,4 +2,4 @@
 /dist
 /vendor
 /disk_usage_exporter
-/exporter.log
+/*.log
