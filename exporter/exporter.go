@@ -333,9 +333,9 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 	// Process all items - let the level-based aggregation handle duplicates
 	// Only skip if this would create infinite recursion (which shouldn't happen in streaming)
 
-	// Create stats key using relative level
+	// Create stats key for the immediate level
 	key := fmt.Sprintf("%s:%d", aggregationPath, relativeLevel)
-	log.Debugf("Creating stats key: %s for item: %s (level: %d -> %d)", key, item.path, item.level, relativeLevel)
+	log.Debugf("Creating stats key: %s for item: %s (level: %d)", key, item.path, relativeLevel)
 
 	// Get or create stats for this path/level
 	sp.statsMutex.Lock()
@@ -352,8 +352,6 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 				return nil
 			}(),
 		}
-	} else {
-		log.Debugf("Using existing stats for key: %s", key)
 	}
 	stats := sp.stats[key]
 	sp.statsMutex.Unlock()
@@ -362,18 +360,22 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 	stats.Lock()
 	defer stats.Unlock()
 
-	// Always collect total size
-	stats.totalSize += item.size
-	log.Debugf("Aggregated item: %s (size: %d, original level: %d -> relative level: %d, isDir: %t)", item.path, item.size, item.level, relativeLevel, item.isDir)
-
+	// Process the item at its immediate level
 	if item.isDir {
+		// For directories: only add size to immediate level, count the directory
+		stats.totalSize += item.size
+		log.Debugf("Directory size %d added only to level %d: %s", item.size, relativeLevel, item.path)
+		
 		// Only increment directory count if flag is enabled
 		if sp.exporter.collectDirCount {
 			stats.directoryCount++
 		}
-		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", item.level, item.path, item.size)
+		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", relativeLevel, item.path, item.size)
 	} else {
-		// Process file metrics based on collection flags
+		// For files: add size to immediate level and count the file
+		stats.totalSize += item.size
+		
+		// Count file at its immediate level only
 		if sp.exporter.collectFileCount {
 			stats.fileCount++
 		}
@@ -383,8 +385,58 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 			sizeRange := getSizeRange(item.size)
 			stats.sizeBuckets[sizeRange]++
 			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", 
-				item.level, item.path, item.size, sizeRange)
+				relativeLevel, item.path, item.size, sizeRange)
 		}
+		
+		// FIX: Propagate file size to all parent directory levels
+		// This ensures level 1 directories include all files from subdirectories
+		sp.propagateFileSizeToParents(aggregationPath, relativeLevel, item.size)
+	}
+}
+
+// propagateFileSizeToParents propagates file size to all parent directory levels
+func (sp *streamingProcessor) propagateFileSizeToParents(startPath string, startLevel int, fileSize int64) {
+	currentPath := startPath
+	
+	// Move up the directory hierarchy and add file size to each parent level
+	for level := startLevel - 1; level >= 0; level-- {
+		currentPath = filepath.Dir(currentPath)
+		
+		// Safety check to prevent infinite loops
+		if currentPath == "/" || currentPath == "." {
+			break
+		}
+		
+		// Stop if we go beyond the root path
+		rootLevel := sp.calculateRelativeLevel(currentPath)
+		if rootLevel < 0 || rootLevel > sp.maxLevel {
+			break
+		}
+		
+		parentKey := fmt.Sprintf("%s:%d", currentPath, rootLevel)
+		
+		// Get or create stats for parent level
+		sp.statsMutex.Lock()
+		if sp.stats[parentKey] == nil {
+			sp.stats[parentKey] = &aggregatedStats{
+				path:  currentPath,
+				level: rootLevel,
+				sizeBuckets: func() map[string]int64 {
+					if sp.exporter.collectSizeBucket {
+						return make(map[string]int64)
+					}
+					return nil
+				}(),
+			}
+		}
+		parentStats := sp.stats[parentKey]
+		sp.statsMutex.Unlock()
+		
+		// Add file size to parent level
+		parentStats.Lock()
+		parentStats.totalSize += fileSize
+		log.Debugf("Propagated file size %d to parent level %d: %s", fileSize, rootLevel, currentPath)
+		parentStats.Unlock()
 	}
 }
 
@@ -1362,32 +1414,46 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	}
 	stats := e.tempStats[key]
 	e.tempStatsMutex.Unlock()
-	
+
 	// Update directory-level statistics
 	stats.Lock()
-	// Always collect total size for node_disk_usage metric
-	stats.totalSize += item.GetUsage()
+	itemSize := item.GetUsage()
 	
+	// Process the item at its immediate level
 	if item.IsDir() {
+		// For directories: only add size to immediate level, count the directory
+		stats.totalSize += itemSize
+		log.Debugf("Directory size %d added only to level %d: %s", itemSize, level, path)
+		
 		// Only increment directory count if flag is enabled
 		if e.collectDirCount {
 			stats.directoryCount++
 		}
-		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", level, path, item.GetUsage())
+		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", level, path, itemSize)
 	} else {
-		// Process file metrics based on collection flags
+		// For files: add size to immediate level and count the file
+		stats.totalSize += itemSize
+		
+		// Process file metrics at immediate level based on collection flags
 		if e.collectFileCount {
 			stats.fileCount++
 		}
 		
 		// Only process size buckets if enabled and sizeBuckets map exists
 		if e.collectSizeBucket && stats.sizeBuckets != nil {
-			sizeRange := getSizeRange(item.GetUsage())
+			sizeRange := getSizeRange(itemSize)
 			stats.sizeBuckets[sizeRange]++
-			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", level, path, item.GetUsage(), sizeRange)
+			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", level, path, itemSize, sizeRange)
 		}
 	}
+	
 	stats.Unlock()
+	
+	// FIX: For files, propagate size to all parent directory levels
+	// This ensures level 1 directories include all files from subdirectories
+	if !item.IsDir() {
+		e.propagateFileSizeToParents(aggregationPath, level, itemSize, rootPath)
+	}
 
 	// EARLY TERMINATION: Skip subdirectory processing if we've reached maxLevel
 	// This prevents memory spike from loading large directory structures unnecessarily
@@ -1440,6 +1506,63 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 		log.Debugf("[Level %d] Completed scan: %s (processed: %d/%d entries, skipped: %d)", 
 			level, path, processedCount, len(files), skippedCount)
 	}()
+}
+
+// propagateFileSizeToParents propagates file size to all parent directory levels for collectAggregatedStats
+func (e *Exporter) propagateFileSizeToParents(startPath string, startLevel int, fileSize int64, rootPath string) {
+	currentPath := startPath
+	
+	// Move up the directory hierarchy and add file size to each parent level
+	for level := startLevel - 1; level >= 0; level-- {
+		currentPath = filepath.Dir(currentPath)
+		
+		// Safety check to prevent infinite loops
+		if currentPath == "/" || currentPath == "." {
+			break
+		}
+		
+		// Calculate actual level for this path
+		actualLevel := level
+		if currentPath == rootPath {
+			actualLevel = 0
+		}
+		
+		// Skip if we've gone beyond the root path
+		if len(currentPath) < len(rootPath) {
+			break
+		}
+		
+		parentKey := fmt.Sprintf("%s:%d", currentPath, actualLevel)
+		
+		// Get or create stats for parent level
+		e.tempStatsMutex.Lock()
+		if e.tempStats[parentKey] == nil {
+			e.tempStats[parentKey] = &aggregatedStats{
+				path:        currentPath,
+				level:       actualLevel,
+				sizeBuckets: func() map[string]int64 {
+					if e.collectSizeBucket {
+						return make(map[string]int64)
+					}
+					return nil
+				}(),
+				topFiles: nil,
+			}
+		}
+		parentStats := e.tempStats[parentKey]
+		e.tempStatsMutex.Unlock()
+		
+		// Add file size to parent level
+		parentStats.Lock()
+		parentStats.totalSize += fileSize
+		log.Debugf("Propagated file size %d to parent level %d: %s", fileSize, actualLevel, currentPath)
+		parentStats.Unlock()
+		
+		// Stop when we reach the root path
+		if currentPath == rootPath {
+			break
+		}
+	}
 }
 
 // convertToAggregatedStats converts fs.Item to lightweight aggregated stats
