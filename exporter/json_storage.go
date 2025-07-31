@@ -195,10 +195,10 @@ func (js *JSONStorage) storeDirRecursive(path string, item fs.Item, currentLevel
 		if err := txn.Set(key, jsonData); err != nil {
 			return fmt.Errorf("failed to store in BadgerDB: %w", err)
 		}
-		log.Debugf("Stored lightweight stats for path: %s (level: %d, size: %d bytes)", path, currentLevel, len(jsonData))
+		log.Tracef("Stored stats for path: %s (level: %d, size: %d bytes)", path, currentLevel, len(jsonData))
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
@@ -299,7 +299,7 @@ func (js *JSONStorage) loadLevelBasedData(path string, maxLevel int) (fs.Item, e
 	// Try to load data for level 0 (root level)
 	var jsonData []byte
 	levelKey := fmt.Sprintf("%s:level:0:stats", path)
-	
+
 	err := js.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(levelKey))
 		if err != nil {

@@ -481,7 +481,12 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 			
 			// Track scan time for each path
 			startTime := time.Now()
-			log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
+			maxLevel := e.paths[path]
+			if maxLevel < 0 {
+				maxLevel = 0
+			}
+			log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)", 
+				path, maxLevel, runtime.NumGoroutine())
 			
 			// Use constGC=true for better memory management during intensive analysis
 			// Handle potential database lock errors during analysis
@@ -528,6 +533,7 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 			e.cachedStats = make(map[string]map[string]*aggregatedStats)
 		}
 		// Convert fs.Item to aggregated stats to save memory
+		// MEMORY OPTIMIZATION: Process level-limited aggregated stats immediately
 		e.convertToAggregatedStats(result.path, result.result)
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
@@ -538,6 +544,11 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 			e.queueStorageWrite(result.path, result.result)
 		}
 		
+		// MEMORY OPTIMIZATION: Immediately release the full fs.Item result after processing
+		// This prevents holding large directory structures in memory longer than necessary
+		result.result = nil
+		runtime.GC() // Suggest garbage collection to free the large fs.Item structure
+		
 		// Log scan completion time with goroutine stats
 		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", result.path, result.elapsed, runtime.NumGoroutine())
 	}
@@ -547,13 +558,19 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 	for path := range e.paths {
 		// Track scan time for each path
 		startTime := time.Now()
-		log.Infof("Starting background scan for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
+		maxLevel := e.paths[path]
+		if maxLevel < 0 {
+			maxLevel = 0
+		}
+		log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)", 
+			path, maxLevel, runtime.NumGoroutine())
 		
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		
 		// Convert and store results in lightweight stats cache
+		// MEMORY OPTIMIZATION: Process level-limited aggregated stats immediately
 		e.mu.Lock()
 		e.convertToAggregatedStats(path, dir)
 		e.lastScanTime = time.Now()
@@ -563,6 +580,11 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 		if e.diskCaching && e.jsonStorage != nil {
 			e.queueStorageWrite(path, dir)
 		}
+		
+		// MEMORY OPTIMIZATION: Release the full fs.Item after processing to free memory
+		// This is especially important when scanning large directory structures
+		dir = nil
+		runtime.GC() // Suggest garbage collection to free the large fs.Item structure
 		
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
@@ -774,9 +796,24 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 
 	path := item.GetPath()
 	
-	// Log directory scanning progress by level
+	// Log directory scanning start and progress by level
 	if item.IsDir() {
-		log.Debugf("[Level %d] Scanning directory: %s (files: %d)", level, path, len(item.GetFiles()))
+		files := item.GetFiles()
+		fileCount := 0
+		dirCount := 0
+		if files != nil {
+			for _, file := range files {
+				if file != nil {
+					if file.IsDir() {
+						dirCount++
+					} else {
+						fileCount++
+					}
+				}
+			}
+		}
+		log.Debugf("[Level %d] Starting scan: %s (subdirs: %d, files: %d, total: %d)", 
+			level, path, dirCount, fileCount, len(files))
 	}
 	
 	// Skip files if no file-related metrics are needed
@@ -856,49 +893,61 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	}
 	stats.Unlock()
 
-	// Recursively process subdirectories
-	if item.IsDir() && level+1 <= maxLevel {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warnf("Storage access error during collectAggregatedStats for %s: %v", path, r)
-					return
-				}
-			}()
-			
-			files := item.GetFiles()
-			if files == nil {
-				log.Debugf("[Level %d] No files found for directory: %s", level, path)
+	// EARLY TERMINATION: Skip subdirectory processing if we've reached maxLevel
+	// This prevents memory spike from loading large directory structures unnecessarily
+	if !item.IsDir() || level >= maxLevel {
+		return // Don't process subdirectories if we're at or beyond maxLevel
+	}
+	
+	// Recursively process subdirectories only if within level limit
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warnf("Storage access error during collectAggregatedStats for %s: %v", path, r)
 				return
 			}
-			
-			log.Debugf("[Level %d] Processing %d entries in directory: %s", level, len(files), path)
-			
-			// OPTIMIZATION: Only process entries if we need the data
-			processedCount := 0
-			for _, entry := range files {
-				if entry == nil {
-					continue
-				}
-				
-				// Skip processing if no relevant metrics needed for this entry type
-				if entry.IsDir() && !e.collectDirCount && level+1 > maxLevel {
-					continue
-				}
-				if !entry.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
-					continue
-				}
-				
-				e.collectAggregatedStats(entry, level+1, maxLevel, rootPath)
-				processedCount++
+		}()
+		
+		// MEMORY OPTIMIZATION: Only call GetFiles() if we actually need to process subdirectories
+		// This prevents loading 100k+ directory entries into memory when level limit is reached
+		files := item.GetFiles()
+		if files == nil {
+			log.Debugf("[Level %d] No files found for directory: %s", level, path)
+			return
+		}
+		
+		log.Debugf("[Level %d] Processing %d entries in directory: %s (maxLevel: %d)", level, len(files), path, maxLevel)
+		
+		// OPTIMIZATION: Only process entries if we need the data
+		processedCount := 0
+		for _, entry := range files {
+			if entry == nil {
+				continue
 			}
 			
-			log.Debugf("[Level %d] Completed directory: %s (processed: %d/%d entries)", level, path, processedCount, len(files))
-		}()
-	}
+			// EARLY TERMINATION: Skip directories that would exceed maxLevel
+			if entry.IsDir() && level+1 > maxLevel {
+				log.Tracef("[Level %d] Skipping directory beyond maxLevel: %s", level+1, entry.GetPath())
+				continue
+			}
+			
+			// Skip processing if no relevant metrics needed for this entry type
+			if !entry.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
+				continue
+			}
+			
+			e.collectAggregatedStats(entry, level+1, maxLevel, rootPath)
+			processedCount++
+		}
+		
+		skippedCount := len(files) - processedCount
+		log.Debugf("[Level %d] Completed scan: %s (processed: %d/%d entries, skipped: %d)", 
+			level, path, processedCount, len(files), skippedCount)
+	}()
 }
 
 // convertToAggregatedStats converts fs.Item to lightweight aggregated stats
+// MEMORY OPTIMIZATION: Only processes directories up to the configured level limit
 func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
 	if item == nil {
 		return
@@ -908,6 +957,9 @@ func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
 	if level < 0 {
 		level = 0
 	}
+	
+	// MEMORY OPTIMIZATION: Log level limits for debugging large directory issues
+	log.Debugf("Converting fs.Item to aggregated stats for path: %s (maxLevel: %d)", rootPath, level)
 	
 	// Initialize path stats if needed
 	if e.cachedStats[rootPath] == nil {
@@ -919,7 +971,8 @@ func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
 	e.tempStats = make(map[string]*aggregatedStats)
 	e.tempStatsMutex.Unlock()
 	
-	// Collect stats from the fs.Item structure
+	// EARLY TERMINATION: Collect stats from the fs.Item structure with strict level limits
+	// This prevents processing beyond the configured dir-level, saving memory
 	e.collectAggregatedStats(item, 0, level, rootPath)
 	
 	// Copy temp stats to cached stats
