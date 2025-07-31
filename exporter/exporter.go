@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,9 +194,12 @@ func (sp *streamingProcessor) processDirectoryStreaming() error {
 
 // traverseDirectoryStreaming recursively processes directories with immediate memory cleanup
 func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level int) error {
-	// EARLY TERMINATION: Stop if we exceed maxLevel
-	if level > sp.maxLevel {
-		log.Tracef("Skipping directory beyond maxLevel: %s (level: %d)", dirPath, level)
+	// Calculate relative level for this directory
+	relativeLevel := sp.calculateRelativeLevel(dirPath)
+	
+	// EARLY TERMINATION: Stop if we exceed maxLevel (relative to root)
+	if relativeLevel > sp.maxLevel {
+		log.Tracef("Skipping directory beyond maxLevel: %s (relative level: %d > %d)", dirPath, relativeLevel, sp.maxLevel)
 		return nil
 	}
 
@@ -266,17 +270,22 @@ func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level i
 		level, dirPath, dirCount, fileCount, processedCount)
 
 	// Recursively process subdirectories only if within level limit
-	if level < sp.maxLevel {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				subDirPath := filepath.Join(dirPath, entry.Name())
-				if !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
-					err := sp.traverseDirectoryStreaming(subDirPath, level+1)
-					if err != nil {
-						log.Warnf("Failed to process subdirectory %s: %v", subDirPath, err)
-						// Continue with other directories instead of failing completely
-					}
+	// Check relative level for subdirectories to respect maxLevel constraints
+	for _, entry := range entries {
+		if entry.IsDir() {
+			subDirPath := filepath.Join(dirPath, entry.Name())
+			subDirRelativeLevel := sp.calculateRelativeLevel(subDirPath)
+			
+			// Only traverse if the subdirectory's relative level is within limit
+			if subDirRelativeLevel <= sp.maxLevel && !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
+				err := sp.traverseDirectoryStreaming(subDirPath, level+1)
+				if err != nil {
+					log.Warnf("Failed to process subdirectory %s: %v", subDirPath, err)
+					// Continue with other directories instead of failing completely
 				}
+			} else if subDirRelativeLevel > sp.maxLevel {
+				log.Tracef("Skipping subdirectory beyond maxLevel: %s (relative level: %d > %d)", 
+					subDirPath, subDirRelativeLevel, sp.maxLevel)
 			}
 		}
 	}
@@ -312,12 +321,21 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 		aggregationPath = filepath.Dir(item.path)
 	}
 
+	// Calculate level relative to root path
+	relativeLevel := sp.calculateRelativeLevel(aggregationPath)
+	
+	// Skip items that exceed the level constraint
+	if relativeLevel > sp.maxLevel {
+		log.Tracef("Skipping item beyond maxLevel: %s (relative level: %d > %d)", item.path, relativeLevel, sp.maxLevel)
+		return
+	}
+	
 	// Process all items - let the level-based aggregation handle duplicates
 	// Only skip if this would create infinite recursion (which shouldn't happen in streaming)
 
-	// Create stats key
-	key := fmt.Sprintf("%s:%d", aggregationPath, item.level)
-	log.Debugf("Creating stats key: %s for item: %s", key, item.path)
+	// Create stats key using relative level
+	key := fmt.Sprintf("%s:%d", aggregationPath, relativeLevel)
+	log.Debugf("Creating stats key: %s for item: %s (level: %d -> %d)", key, item.path, item.level, relativeLevel)
 
 	// Get or create stats for this path/level
 	sp.statsMutex.Lock()
@@ -325,7 +343,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 		log.Debugf("Creating new stats for key: %s", key)
 		sp.stats[key] = &aggregatedStats{
 			path:  aggregationPath,
-			level: item.level,
+			level: relativeLevel,
 			// Only initialize sizeBuckets if needed
 			sizeBuckets: func() map[string]int64 {
 				if sp.exporter.collectSizeBucket {
@@ -346,7 +364,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 
 	// Always collect total size
 	stats.totalSize += item.size
-	log.Debugf("Aggregated item: %s (size: %d, level: %d, isDir: %t)", item.path, item.size, item.level, item.isDir)
+	log.Debugf("Aggregated item: %s (size: %d, original level: %d -> relative level: %d, isDir: %t)", item.path, item.size, item.level, relativeLevel, item.isDir)
 
 	if item.isDir {
 		// Only increment directory count if flag is enabled
@@ -368,6 +386,35 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 				item.level, item.path, item.size, sizeRange)
 		}
 	}
+}
+
+// calculateRelativeLevel calculates the level relative to the root path
+func (sp *streamingProcessor) calculateRelativeLevel(path string) int {
+	// Clean both paths to ensure consistent comparison
+	cleanRootPath := filepath.Clean(sp.rootPath)
+	cleanPath := filepath.Clean(path)
+	
+	// If the path is the same as root path, level is 0
+	if cleanPath == cleanRootPath {
+		return 0
+	}
+	
+	// Check if path is within root path
+	if !strings.HasPrefix(cleanPath, cleanRootPath+string(filepath.Separator)) {
+		// Path is not within root path, return 0 for safety
+		return 0
+	}
+	
+	// Get relative path from root
+	relativePath := strings.TrimPrefix(cleanPath, cleanRootPath+string(filepath.Separator))
+	
+	// Count directory separators to determine level
+	if relativePath == "" {
+		return 0
+	}
+	
+	level := strings.Count(relativePath, string(filepath.Separator)) + 1
+	return level
 }
 
 // getStreamingStats returns the collected statistics and transfers ownership

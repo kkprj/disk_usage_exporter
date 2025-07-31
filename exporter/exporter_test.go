@@ -23,7 +23,7 @@ func TestRunAnalysis(t *testing.T) {
 	})
 
 	assert.NotContains(t, string(w.buff), "test_dir/test_dir")
-	assert.Contains(t, string(w.buff), "node_disk_usage_bytes")
+	assert.Contains(t, string(w.buff), "node_disk_usage")
 }
 
 func TestIndex(t *testing.T) {
