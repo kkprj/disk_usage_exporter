@@ -4,7 +4,8 @@
 # Basic configuration
 # analyzed-path: "/mnt/meta-test"
 # analyzed-path: "/home/kklee228"
-analyzed-path: "/srv/nfs/shared/meta-test"
+analyzed-path: "/"
+# analyzed-path: "/srv/nfs/shared/meta-test"
 bind-address: "0.0.0.0:9996"
 dir-level: 3
 mode: "http"
@@ -14,9 +15,12 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# Maximum number for parallel processing
 max-procs: 12
+
+# Chunk size configuration
+# Number of files/directories processed in each batch before memory cleanup
+chunk-size: 1000
 
 # Whether to collect node_disk_usage_directory_count
 dir-count: false
