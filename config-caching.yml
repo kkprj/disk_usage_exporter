@@ -15,9 +15,12 @@ follow-symlinks: false
 # Available levels: trace, debug, info, warn, error, fatal, panic
 log-level: "debug"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# Maximum number for parallel processing
 max-procs: 12
+
+# Chunk size configuration
+# Number of files/directories processed in each batch before memory cleanup
+chunk-size: 1000
 
 # Whether to collect node_disk_usage_directory_count
 dir-count: false

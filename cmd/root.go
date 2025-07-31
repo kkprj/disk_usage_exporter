@@ -120,8 +120,9 @@ and reporting which directories consume what space.`,
 			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"), viper.GetBool("disk-caching"))
 		}
 		
-		// Configure max processors
+		// Configure max processors and chunk size
 		e.SetMaxProcs(viper.GetInt("max-procs"))
+		e.SetChunkSize(viper.GetInt("chunk-size"))
 
 		if viper.GetString("mode") == "file" {
 			e.WriteToTextfile(viper.GetString("output-file"))
@@ -166,6 +167,7 @@ func init() {
 	flags.Bool("disk-caching", false, "Enable disk caching with BadgerDB + JSON storage")
 	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
 	flags.IntP("max-procs", "j", 4, "Maximum number of CPU cores to use for parallel processing")
+	flags.Int("chunk-size", 1000, "Number of files/directories processed in each batch before memory cleanup")
 
 	viper.BindPFlags(flags)
 }

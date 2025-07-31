@@ -137,6 +137,21 @@ type streamingItem struct {
 	modTime  time.Time
 }
 
+// workUnit represents a unit of work for the worker pool
+type workUnit struct {
+	rootPath string
+	dirPath  string
+	level    int
+	maxLevel int
+}
+
+// workResult represents the result of processing a work unit
+type workResult struct {
+	rootPath string
+	stats    map[string]*aggregatedStats
+	err      error
+}
+
 // streamingProcessor handles memory-efficient directory traversal
 type streamingProcessor struct {
 	exporter     *Exporter
@@ -150,13 +165,14 @@ type streamingProcessor struct {
 
 // newStreamingProcessor creates a new streaming processor
 func newStreamingProcessor(exporter *Exporter, rootPath string, maxLevel int) *streamingProcessor {
+	batchSize := exporter.chunkSize
 	return &streamingProcessor{
 		exporter:     exporter,
 		rootPath:     rootPath,
 		maxLevel:     maxLevel,
 		stats:        make(map[string]*aggregatedStats),
-		batchSize:    1000, // Process 1000 items at a time
-		currentBatch: make([]streamingItem, 0, 1000),
+		batchSize:    batchSize,
+		currentBatch: make([]streamingItem, 0, batchSize),
 	}
 }
 
@@ -413,6 +429,7 @@ type Exporter struct {
 	useStorage     bool
 	diskCaching    bool
 	maxProcs       int
+	chunkSize      int
 	collectDirCount    bool
 	collectFileCount   bool
 	collectSizeBucket  bool
@@ -445,7 +462,8 @@ func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 		followSymlinks:  followSymlinks,
 		paths:           paths,
 		stopChan:        make(chan struct{}),
-		maxProcs:        4, // default value
+		maxProcs:        4,    // default value
+		chunkSize:       1000, // default chunk size
 		writeQueue:      make(chan writeRequest, 100), // Buffer for write requests
 		writerDone:      make(chan struct{}),
 		aggregatedStats: make(map[string]*aggregatedStats),
@@ -475,6 +493,14 @@ func (e *Exporter) SetMaxProcs(maxProcs int) {
 		maxProcs = 4 // default value
 	}
 	e.maxProcs = maxProcs
+}
+
+// SetChunkSize sets the chunk size for batch processing
+func (e *Exporter) SetChunkSize(chunkSize int) {
+	if chunkSize <= 0 {
+		chunkSize = 1000 // default value
+	}
+	e.chunkSize = chunkSize
 }
 
 // SetCollectionFlags sets which metrics to collect
@@ -678,75 +704,82 @@ func (e *Exporter) performScan() {
 	log.Info("All streaming background scans completed")
 }
 
-// performStreamingAnalysis performs memory-efficient streaming analysis for all paths
+// performStreamingAnalysis performs memory-efficient streaming analysis for all paths using worker pool
 func (e *Exporter) performStreamingAnalysis() {
-	// Use WaitGroup for parallel analysis
-	var wg sync.WaitGroup
-	
-	// Channel for results to prevent race conditions
-	resultChan := make(chan struct {
-		path    string
-		stats   map[string]*aggregatedStats
-		elapsed time.Duration
-		err     error
-	}, len(e.paths))
-	
-	// Start parallel streaming analysis for each path
-	for path := range e.paths {
-		wg.Add(1)
-		go func(path string) {
-			defer wg.Done()
-			
-			// Track scan time for each path
-			startTime := time.Now()
-			maxLevel := e.paths[path]
-			if maxLevel < 0 {
-				maxLevel = 0
-			}
-			log.Infof("Starting streaming scan for path: %s (dir-level: %d, goroutines: %d)", 
-				path, maxLevel, runtime.NumGoroutine())
-			
-			// Create streaming processor for this path
-			processor := newStreamingProcessor(e, path, maxLevel)
-			
-			// Perform streaming analysis
-			err := processor.processDirectoryStreaming()
-			var stats map[string]*aggregatedStats
-			if err == nil {
-				stats = processor.getStreamingStats()
-			}
-			
-			// Send result to channel
-			resultChan <- struct {
-				path    string
-				stats   map[string]*aggregatedStats
-				elapsed time.Duration
-				err     error
-			}{
-				path:    path,
-				stats:   stats,
-				elapsed: time.Since(startTime),
-				err:     err,
-			}
-		}(path)
+	// Create work units for all paths
+	workUnits := make([]workUnit, 0, len(e.paths))
+	for path, maxLevel := range e.paths {
+		if maxLevel < 0 {
+			maxLevel = 0
+		}
+		workUnits = append(workUnits, workUnit{
+			rootPath: path,
+			dirPath:  path,
+			level:    0,
+			maxLevel: maxLevel,
+		})
 	}
 	
-	// Wait for all analysis to complete
+	// Create channels for work distribution
+	workChan := make(chan workUnit, len(workUnits))
+	resultChan := make(chan workResult, len(workUnits))
+	
+	// Fill work channel
+	for _, unit := range workUnits {
+		workChan <- unit
+	}
+	close(workChan)
+	
+	// Start worker pool with max-procs workers
+	var wg sync.WaitGroup
+	for i := 0; i < e.maxProcs; i++ {
+		wg.Add(1)
+		go e.streamingWorker(i, workChan, resultChan, &wg)
+	}
+	
+	// Wait for all workers to complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 	
 	// Process results and store aggregated stats
+	pathResults := make(map[string]struct {
+		stats   map[string]*aggregatedStats
+		elapsed time.Duration
+		err     error
+	})
+	
 	for result := range resultChan {
 		if result.err != nil {
-			log.Warnf("Streaming scan failed for path %s: %v", result.path, result.err)
+			log.Warnf("Streaming scan failed for path %s: %v", result.rootPath, result.err)
 			continue
 		}
 		
+		// Merge stats for the same root path
+		if existing, ok := pathResults[result.rootPath]; ok {
+			// Merge stats maps
+			for key, stats := range result.stats {
+				existing.stats[key] = stats
+			}
+		} else {
+			pathResults[result.rootPath] = struct {
+				stats   map[string]*aggregatedStats
+				elapsed time.Duration
+				err     error
+			}{
+				stats:   result.stats,
+				elapsed: time.Duration(0), // Will be updated with actual timing
+				err:     result.err,
+			}
+		}
+	}
+	
+	// Store final results
+	for path, result := range pathResults {
 		// Store aggregated stats in cache
 		e.mu.Lock()
-		e.cachedStats[result.path] = result.stats
+		e.cachedStats[path] = result.stats
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
 		
@@ -754,16 +787,53 @@ func (e *Exporter) performStreamingAnalysis() {
 		if e.diskCaching && e.jsonStorage != nil && len(result.stats) > 0 {
 			// Create a dummy fs.Item for storage compatibility
 			// Note: This should be replaced with native aggregatedStats storage
-			log.Debugf("Skipping fs.Item-based storage for streaming results (path: %s)", result.path)
+			log.Debugf("Skipping fs.Item-based storage for streaming results (path: %s)", path)
 		}
 		
 		// Log scan completion time with goroutine stats
-		log.Infof("Streaming scan completed for path: %s, elapsed time: %v, stats: %d, goroutines: %d", 
-			result.path, result.elapsed, len(result.stats), runtime.NumGoroutine())
+		log.Infof("Streaming scan completed for path: %s, stats: %d, workers: %d", 
+			path, len(result.stats), e.maxProcs)
 	}
 	
 	// Update results validity
 	e.setValidResults(true)
+}
+
+// streamingWorker processes work units from the work channel using streaming analysis
+func (e *Exporter) streamingWorker(workerID int, workChan <-chan workUnit, resultChan chan<- workResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	
+	log.Debugf("Worker %d started", workerID)
+	
+	for unit := range workChan {
+		log.Infof("Worker %d: Starting streaming scan for path: %s (dir-level: %d)", 
+			workerID, unit.rootPath, unit.maxLevel)
+		
+		startTime := time.Now()
+		
+		// Create streaming processor for this work unit
+		processor := newStreamingProcessor(e, unit.rootPath, unit.maxLevel)
+		
+		// Perform streaming analysis
+		err := processor.processDirectoryStreaming()
+		var stats map[string]*aggregatedStats
+		if err == nil {
+			stats = processor.getStreamingStats()
+		}
+		
+		// Send result
+		resultChan <- workResult{
+			rootPath: unit.rootPath,
+			stats:    stats,
+			err:      err,
+		}
+		
+		elapsed := time.Since(startTime)
+		log.Infof("Worker %d: Completed streaming scan for path: %s, elapsed: %v, stats: %d", 
+			workerID, unit.rootPath, elapsed, len(stats))
+	}
+	
+	log.Debugf("Worker %d finished", workerID)
 }
 
 func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
