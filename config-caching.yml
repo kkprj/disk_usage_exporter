@@ -4,8 +4,8 @@
 # Basic configuration
 # analyzed-path: "/mnt/meta-test"
 # analyzed-path: "/home/kklee228"
-analyzed-path: "/"
-# analyzed-path: "/srv/nfs/shared/meta-test"
+# analyzed-path: "/"
+analyzed-path: "/srv/nfs/shared/meta-test"
 bind-address: "0.0.0.0:9996"
 dir-level: 3
 mode: "http"
