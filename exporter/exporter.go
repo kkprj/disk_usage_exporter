@@ -197,10 +197,10 @@ func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level i
 	// Calculate relative level for this directory
 	relativeLevel := sp.calculateRelativeLevel(dirPath)
 	
-	// EARLY TERMINATION: Stop if we exceed maxLevel (relative to root)
-	if relativeLevel > sp.maxLevel {
-		log.Tracef("Skipping directory beyond maxLevel: %s (relative level: %d > %d)", dirPath, relativeLevel, sp.maxLevel)
-		return nil
+	// Continue scanning beyond maxLevel for files, but don't create directory metrics
+	scanForFilesOnly := relativeLevel > sp.maxLevel
+	if scanForFilesOnly {
+		log.Tracef("Scanning beyond maxLevel for files only: %s (relative level: %d > %d)", dirPath, relativeLevel, sp.maxLevel)
 	}
 
 	log.Debugf("[Level %d] Starting streaming scan: %s", level, dirPath)
@@ -274,18 +274,14 @@ func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level i
 	for _, entry := range entries {
 		if entry.IsDir() {
 			subDirPath := filepath.Join(dirPath, entry.Name())
-			subDirRelativeLevel := sp.calculateRelativeLevel(subDirPath)
 			
-			// Only traverse if the subdirectory's relative level is within limit
-			if subDirRelativeLevel <= sp.maxLevel && !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
+			// Always traverse subdirectories to find files, even beyond maxLevel
+			if !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
 				err := sp.traverseDirectoryStreaming(subDirPath, level+1)
 				if err != nil {
 					log.Warnf("Failed to process subdirectory %s: %v", subDirPath, err)
 					// Continue with other directories instead of failing completely
 				}
-			} else if subDirRelativeLevel > sp.maxLevel {
-				log.Tracef("Skipping subdirectory beyond maxLevel: %s (relative level: %d > %d)", 
-					subDirPath, subDirRelativeLevel, sp.maxLevel)
 			}
 		}
 	}
@@ -324,10 +320,19 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 	// Calculate level relative to root path
 	relativeLevel := sp.calculateRelativeLevel(aggregationPath)
 	
-	// Skip items that exceed the level constraint
-	if relativeLevel > sp.maxLevel {
-		log.Tracef("Skipping item beyond maxLevel: %s (relative level: %d > %d)", item.path, relativeLevel, sp.maxLevel)
-		return
+	// For items beyond maxLevel: still process files for propagation, skip directory metrics
+	beyondMaxLevel := relativeLevel > sp.maxLevel
+	if beyondMaxLevel {
+		if item.isDir {
+			// Skip directory metrics beyond maxLevel, but still propagate any files found
+			log.Tracef("Skipping directory metrics beyond maxLevel: %s (relative level: %d > %d)", item.path, relativeLevel, sp.maxLevel)
+			return
+		} else {
+			// For files beyond maxLevel: only propagate to parent levels, don't create level metrics
+			log.Tracef("Processing file beyond maxLevel for propagation only: %s (relative level: %d > %d)", item.path, relativeLevel, sp.maxLevel)
+			sp.propagateFileSizeToParents(aggregationPath, relativeLevel, item.size)
+			return
+		}
 	}
 	
 	// Process all items - let the level-based aggregation handle duplicates
@@ -409,7 +414,7 @@ func (sp *streamingProcessor) propagateFileSizeToParents(startPath string, start
 		
 		// Stop if we go beyond the root path
 		rootLevel := sp.calculateRelativeLevel(currentPath)
-		if rootLevel < 0 || rootLevel > sp.maxLevel {
+		if rootLevel < 0 {
 			break
 		}
 		

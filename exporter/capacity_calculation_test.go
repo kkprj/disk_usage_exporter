@@ -83,15 +83,15 @@ func TestDirectoryCapacityCalculation(t *testing.T) {
 			dirLevel:    2,
 			description: "Level 2 test - limited depth",
 			expectedSizes: map[string]int64{
-				// Level 0 (root) should contain all accessible files (level 3 files won't be counted)
-				fmt.Sprintf("%s:0", testRoot): 1700, // 100+200+300+500+600 (excluding 400 from level 3)
+				// Level 0 (root) should now contain ALL files (level 3 files ARE counted after fix)
+				fmt.Sprintf("%s:0", testRoot): 2100, // 100+200+300+400+500+600 (now includes 400 from level 3)
 
-				// Level 1 directories 
-				fmt.Sprintf("%s/level1-dir1:1", testRoot): 1100, // 100+200+300+500 (excluding 400 from level 3)
+				// Level 1 directories should now include level 3 files
+				fmt.Sprintf("%s/level1-dir1:1", testRoot): 1500, // 100+200+300+400+500 (now includes 400 from level 3)
 				fmt.Sprintf("%s/level1-dir2:1", testRoot): 600,  // 600
 
-				// Level 2 directories should contain only their direct children (no level 3)
-				fmt.Sprintf("%s/level1-dir1/level2-dir1:2", testRoot): 300, // 300 only (400 is at level 3, not counted)
+				// Level 2 directories should now include level 3 files
+				fmt.Sprintf("%s/level1-dir1/level2-dir1:2", testRoot): 700, // 300+400 (now includes 400 from level 3)
 				fmt.Sprintf("%s/level1-dir1/level2-dir2:2", testRoot): 500, // 500
 			},
 		},
@@ -99,11 +99,11 @@ func TestDirectoryCapacityCalculation(t *testing.T) {
 			dirLevel:    1,
 			description: "Level 1 test - shallow depth",
 			expectedSizes: map[string]int64{
-				// Level 0 (root) should contain all accessible files (only level 1 files)
-				fmt.Sprintf("%s:0", testRoot): 900, // 100+200+600 (only direct level 1 files)
+				// Level 0 (root) should now contain ALL files from deeper levels too
+				fmt.Sprintf("%s:0", testRoot): 2100, // 100+200+300+400+500+600 (now includes all deeper files)
 
-				// Level 1 directories should contain only their direct children
-				fmt.Sprintf("%s/level1-dir1:1", testRoot): 300, // 100+200 (only direct files)
+				// Level 1 directories should now include all their descendant files
+				fmt.Sprintf("%s/level1-dir1:1", testRoot): 1500, // 100+200+300+400+500 (now includes all deeper files)
 				fmt.Sprintf("%s/level1-dir2:1", testRoot): 600, // 600
 			},
 		},
