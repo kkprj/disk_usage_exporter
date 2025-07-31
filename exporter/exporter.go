@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -125,6 +126,242 @@ func getSizeRange(size int64) string {
 	} else {
 		return "100MB+"
 	}
+}
+
+// streamingItem represents a lightweight file system item for streaming processing
+type streamingItem struct {
+	path     string
+	size     int64
+	isDir    bool
+	level    int
+	modTime  time.Time
+}
+
+// streamingProcessor handles memory-efficient directory traversal
+type streamingProcessor struct {
+	exporter     *Exporter
+	rootPath     string
+	maxLevel     int
+	stats        map[string]*aggregatedStats
+	statsMutex   sync.RWMutex
+	batchSize    int
+	currentBatch []streamingItem
+}
+
+// newStreamingProcessor creates a new streaming processor
+func newStreamingProcessor(exporter *Exporter, rootPath string, maxLevel int) *streamingProcessor {
+	return &streamingProcessor{
+		exporter:     exporter,
+		rootPath:     rootPath,
+		maxLevel:     maxLevel,
+		stats:        make(map[string]*aggregatedStats),
+		batchSize:    1000, // Process 1000 items at a time
+		currentBatch: make([]streamingItem, 0, 1000),
+	}
+}
+
+// processDirectoryStreaming performs memory-efficient directory analysis
+func (sp *streamingProcessor) processDirectoryStreaming() error {
+	log.Debugf("Starting streaming analysis for path: %s (maxLevel: %d)", sp.rootPath, sp.maxLevel)
+	defer func() {
+		// Force cleanup of current batch and stats
+		sp.currentBatch = nil
+		sp.stats = nil
+		runtime.GC()
+		log.Debugf("Completed streaming analysis for path: %s", sp.rootPath)
+	}()
+
+	// Start recursive streaming traversal
+	return sp.traverseDirectoryStreaming(sp.rootPath, 0)
+}
+
+// traverseDirectoryStreaming recursively processes directories with immediate memory cleanup
+func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level int) error {
+	// EARLY TERMINATION: Stop if we exceed maxLevel
+	if level > sp.maxLevel {
+		log.Tracef("Skipping directory beyond maxLevel: %s (level: %d)", dirPath, level)
+		return nil
+	}
+
+	log.Debugf("[Level %d] Starting streaming scan: %s", level, dirPath)
+
+	// Check if directory should be ignored
+	dirName := filepath.Base(dirPath)
+	if sp.exporter.shouldDirBeIgnored(dirName, dirPath) {
+		log.Tracef("Ignoring directory: %s", dirPath)
+		return nil
+	}
+
+	// Read directory entries
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		log.Warnf("Failed to read directory %s: %v", dirPath, err)
+		return err
+	}
+
+	log.Debugf("[Level %d] Processing %d entries in: %s", level, len(entries), dirPath)
+
+	// Process directory entries in batches
+	fileCount := 0
+	dirCount := 0
+	processedCount := 0
+
+	for _, entry := range entries {
+		// Get entry info
+		entryPath := filepath.Join(dirPath, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			log.Warnf("Failed to get info for %s: %v", entryPath, err)
+			continue
+		}
+
+		// Create streaming item
+		item := streamingItem{
+			path:    entryPath,
+			size:    info.Size(),
+			isDir:   entry.IsDir(),
+			level:   level,
+			modTime: info.ModTime(),
+		}
+
+		// Add to current batch
+		sp.currentBatch = append(sp.currentBatch, item)
+
+		// Count items by type
+		if entry.IsDir() {
+			dirCount++
+		} else {
+			fileCount++
+		}
+		processedCount++
+
+		// Process batch when it reaches batchSize
+		if len(sp.currentBatch) >= sp.batchSize {
+			sp.processBatch()
+		}
+	}
+
+	// Process remaining items in batch
+	if len(sp.currentBatch) > 0 {
+		sp.processBatch()
+	}
+
+	log.Debugf("[Level %d] Completed scan: %s (dirs: %d, files: %d, processed: %d)", 
+		level, dirPath, dirCount, fileCount, processedCount)
+
+	// Recursively process subdirectories only if within level limit
+	if level < sp.maxLevel {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				subDirPath := filepath.Join(dirPath, entry.Name())
+				if !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
+					err := sp.traverseDirectoryStreaming(subDirPath, level+1)
+					if err != nil {
+						log.Warnf("Failed to process subdirectory %s: %v", subDirPath, err)
+						// Continue with other directories instead of failing completely
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// processBatch processes the current batch of items and immediately frees memory
+func (sp *streamingProcessor) processBatch() {
+	if len(sp.currentBatch) == 0 {
+		return
+	}
+
+	log.Tracef("Processing batch of %d items", len(sp.currentBatch))
+
+	// Process each item in the batch
+	for _, item := range sp.currentBatch {
+		sp.aggregateStreamingItem(item)
+	}
+
+	// Immediately clear the batch to free memory
+	sp.currentBatch = sp.currentBatch[:0] // Reset slice but keep capacity
+	runtime.GC() // Suggest garbage collection
+
+	log.Tracef("Batch processed and memory freed")
+}
+
+// aggregateStreamingItem aggregates statistics for a single streaming item
+func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
+	// Determine aggregation path (use directory path for files)
+	aggregationPath := item.path
+	if !item.isDir {
+		aggregationPath = filepath.Dir(item.path)
+	}
+
+	// Skip root path at levels > 0 to avoid duplicate counting
+	if aggregationPath == sp.rootPath && item.level > 0 {
+		return
+	}
+
+	// Create stats key
+	key := fmt.Sprintf("%s:%d", aggregationPath, item.level)
+
+	// Get or create stats for this path/level
+	sp.statsMutex.Lock()
+	if sp.stats[key] == nil {
+		sp.stats[key] = &aggregatedStats{
+			path:  aggregationPath,
+			level: item.level,
+			// Only initialize sizeBuckets if needed
+			sizeBuckets: func() map[string]int64 {
+				if sp.exporter.collectSizeBucket {
+					return make(map[string]int64)
+				}
+				return nil
+			}(),
+		}
+	}
+	stats := sp.stats[key]
+	sp.statsMutex.Unlock()
+
+	// Update statistics atomically
+	stats.Lock()
+	defer stats.Unlock()
+
+	// Always collect total size
+	stats.totalSize += item.size
+
+	if item.isDir {
+		// Only increment directory count if flag is enabled
+		if sp.exporter.collectDirCount {
+			stats.directoryCount++
+		}
+		log.Tracef("[Level %d] Directory processed: %s (size: %d bytes)", item.level, item.path, item.size)
+	} else {
+		// Process file metrics based on collection flags
+		if sp.exporter.collectFileCount {
+			stats.fileCount++
+		}
+
+		// Only process size buckets if enabled
+		if sp.exporter.collectSizeBucket && stats.sizeBuckets != nil {
+			sizeRange := getSizeRange(item.size)
+			stats.sizeBuckets[sizeRange]++
+			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", 
+				item.level, item.path, item.size, sizeRange)
+		}
+	}
+}
+
+// getStreamingStats returns the collected statistics and transfers ownership
+func (sp *streamingProcessor) getStreamingStats() map[string]*aggregatedStats {
+	sp.statsMutex.Lock()
+	defer sp.statsMutex.Unlock()
+
+	// Transfer ownership of stats map
+	result := sp.stats
+	sp.stats = make(map[string]*aggregatedStats) // Create new empty map
+
+	log.Debugf("Transferred %d aggregated stats from streaming processor", len(result))
+	return result
 }
 
 // setScanningState sets the scanning state
@@ -426,31 +663,7 @@ func (e *Exporter) runBackgroundScan() {
 func (e *Exporter) performScan() {
 	defer debug.FreeOSMemory()
 
-	log.Infof("Using %d CPU cores for parallel scanning (gdu internal parallelization)", e.maxProcs)
-
-	// Use stored analyzer if storage is configured, otherwise regular analyzer
-	if e.useStorage && e.storagePath != "" {
-		// Handle potential database lock errors during storage analyzer creation
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warnf("Storage analyzer creation failed, falling back to regular analyzer: %v", r)
-					analyzer := analyze.CreateAnalyzer()
-					analyzer.SetFollowSymlinks(e.followSymlinks)
-					e.performAnalysisWithRegular(analyzer)
-					return
-				}
-			}()
-			
-			stored := analyze.CreateStoredAnalyzer(e.storagePath)
-			stored.SetFollowSymlinks(e.followSymlinks)
-			e.performAnalysisWithStored(stored)
-		}()
-	} else {
-		analyzer := analyze.CreateAnalyzer()
-		analyzer.SetFollowSymlinks(e.followSymlinks)
-		e.performAnalysisWithRegular(analyzer)
-	}
+	log.Infof("Using %d CPU cores for streaming scanning (memory-optimized)", e.maxProcs)
 
 	// Initialize cached stats map
 	e.mu.Lock()
@@ -459,7 +672,98 @@ func (e *Exporter) performScan() {
 	}
 	e.mu.Unlock()
 
-	log.Info("All background scans completed")
+	// Use streaming analysis for all paths
+	e.performStreamingAnalysis()
+
+	log.Info("All streaming background scans completed")
+}
+
+// performStreamingAnalysis performs memory-efficient streaming analysis for all paths
+func (e *Exporter) performStreamingAnalysis() {
+	// Use WaitGroup for parallel analysis
+	var wg sync.WaitGroup
+	
+	// Channel for results to prevent race conditions
+	resultChan := make(chan struct {
+		path    string
+		stats   map[string]*aggregatedStats
+		elapsed time.Duration
+		err     error
+	}, len(e.paths))
+	
+	// Start parallel streaming analysis for each path
+	for path := range e.paths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			
+			// Track scan time for each path
+			startTime := time.Now()
+			maxLevel := e.paths[path]
+			if maxLevel < 0 {
+				maxLevel = 0
+			}
+			log.Infof("Starting streaming scan for path: %s (dir-level: %d, goroutines: %d)", 
+				path, maxLevel, runtime.NumGoroutine())
+			
+			// Create streaming processor for this path
+			processor := newStreamingProcessor(e, path, maxLevel)
+			
+			// Perform streaming analysis
+			err := processor.processDirectoryStreaming()
+			var stats map[string]*aggregatedStats
+			if err == nil {
+				stats = processor.getStreamingStats()
+			}
+			
+			// Send result to channel
+			resultChan <- struct {
+				path    string
+				stats   map[string]*aggregatedStats
+				elapsed time.Duration
+				err     error
+			}{
+				path:    path,
+				stats:   stats,
+				elapsed: time.Since(startTime),
+				err:     err,
+			}
+		}(path)
+	}
+	
+	// Wait for all analysis to complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Process results and store aggregated stats
+	for result := range resultChan {
+		if result.err != nil {
+			log.Warnf("Streaming scan failed for path %s: %v", result.path, result.err)
+			continue
+		}
+		
+		// Store aggregated stats in cache
+		e.mu.Lock()
+		e.cachedStats[result.path] = result.stats
+		e.lastScanTime = time.Now()
+		e.mu.Unlock()
+		
+		// Queue storage write if disk caching is enabled
+		if e.diskCaching && e.jsonStorage != nil && len(result.stats) > 0 {
+			// Create a dummy fs.Item for storage compatibility
+			// Note: This should be replaced with native aggregatedStats storage
+			log.Debugf("Skipping fs.Item-based storage for streaming results (path: %s)", result.path)
+		}
+		
+		// Log scan completion time with goroutine stats
+		log.Infof("Streaming scan completed for path: %s, elapsed time: %v, stats: %d, goroutines: %d", 
+			result.path, result.elapsed, len(result.stats), runtime.NumGoroutine())
+	}
+	
+	// Update results validity
+	e.setValidResults(true)
 }
 
 func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
@@ -598,27 +902,83 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
-	log.Infof("Using %d CPU cores for live analysis (gdu internal parallelization)", e.maxProcs)
+	log.Infof("Using %d CPU cores for live streaming analysis (memory-optimized)", e.maxProcs)
 
 	// Set scanning state
 	e.setScanningState(true)
 	defer e.setScanningState(false)
 
-	// Create analyzer once and reuse for better performance
-	if e.useStorage && e.storagePath != "" {
-		stored := analyze.CreateStoredAnalyzer(e.storagePath)
-		stored.SetFollowSymlinks(e.followSymlinks)
-		e.performLiveAnalysisWithStored(stored)
-	} else {
-		analyzer := analyze.CreateAnalyzer()
-		analyzer.SetFollowSymlinks(e.followSymlinks)
-		e.performLiveAnalysisWithRegular(analyzer)
-	}
+	// Use streaming analysis for live results
+	e.performLiveStreamingAnalysis()
 
 	// Mark that we have valid results
 	e.setValidResults(true)
 
-	log.Info("All live analysis completed")
+	log.Info("All live streaming analysis completed")
+}
+
+// performLiveStreamingAnalysis performs live streaming analysis for immediate results
+func (e *Exporter) performLiveStreamingAnalysis() {
+	// Temporary stats for live analysis
+	tempStats := make(map[string]map[string]*aggregatedStats)
+	var tempMutex sync.RWMutex
+
+	// Use WaitGroup for parallel analysis
+	var wg sync.WaitGroup
+	
+	// Start parallel streaming analysis for each path
+	for path := range e.paths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			
+			// Track scan time for each path
+			startTime := time.Now()
+			maxLevel := e.paths[path]
+			if maxLevel < 0 {
+				maxLevel = 0
+			}
+			log.Debugf("Starting live streaming scan for path: %s (dir-level: %d)", path, maxLevel)
+			
+			// Create streaming processor for this path
+			processor := newStreamingProcessor(e, path, maxLevel)
+			
+			// Perform streaming analysis
+			err := processor.processDirectoryStreaming()
+			if err != nil {
+				log.Warnf("Live streaming scan failed for path %s: %v", path, err)
+				return
+			}
+			
+			// Get results and store in temp stats
+			stats := processor.getStreamingStats()
+			tempMutex.Lock()
+			tempStats[path] = stats
+			tempMutex.Unlock()
+			
+			elapsedTime := time.Since(startTime)
+			log.Debugf("Live streaming scan completed for path: %s, elapsed time: %v, stats: %d", 
+				path, elapsedTime, len(stats))
+		}(path)
+	}
+	
+	// Wait for all analysis to complete
+	wg.Wait()
+	
+	// Atomically update aggregated stats for live results
+	e.statsMutex.Lock()
+	e.aggregatedStats = make(map[string]*aggregatedStats)
+	for _, pathStats := range tempStats {
+		for key, stats := range pathStats {
+			e.aggregatedStats[key] = stats
+		}
+	}
+	e.statsMutex.Unlock()
+	
+	// Publish the live results
+	e.publishAggregatedMetrics()
+	
+	log.Debugf("Live streaming analysis results published with %d total stats", len(e.aggregatedStats))
 }
 
 // runAnalysisAsync runs analysis in background without blocking
