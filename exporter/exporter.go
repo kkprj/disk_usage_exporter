@@ -10,11 +10,13 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dundee/disk_usage_exporter/build"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/fs"
+	"github.com/karrick/godirwalk"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -164,17 +166,286 @@ type streamingProcessor struct {
 	currentBatch []streamingItem
 }
 
-// newStreamingProcessor creates a new streaming processor
-func newStreamingProcessor(exporter *Exporter, rootPath string, maxLevel int) *streamingProcessor {
-	batchSize := exporter.chunkSize
-	return &streamingProcessor{
+// processor handles high-performance folder-level directory traversal using godirwalk
+type processor struct {
+	exporter     *Exporter
+	rootPath     string
+	maxLevel     int
+	stats        map[string]*aggregatedStats
+	statsMutex   sync.RWMutex
+	fileCount    int64
+	dirCount     int64
+	processedDirs int64
+}
+
+
+// newProcessor creates a new processor using godirwalk
+func newProcessor(exporter *Exporter, rootPath string, maxLevel int) *processor {
+	return &processor{
 		exporter:     exporter,
 		rootPath:     rootPath,
 		maxLevel:     maxLevel,
 		stats:        make(map[string]*aggregatedStats),
-		batchSize:    batchSize,
-		currentBatch: make([]streamingItem, 0, batchSize),
 	}
+}
+
+// processDirectory performs high-performance folder-level directory analysis using godirwalk
+func (op *processor) processDirectory() error {
+	log.Debugf("Starting analysis for path: %s (maxLevel: %d)", op.rootPath, op.maxLevel)
+	defer func() {
+		runtime.GC()
+		log.Debugf("Completed analysis for path: %s (dirs processed: %d, files: %d)", 
+			op.rootPath, op.processedDirs, op.fileCount)
+	}()
+
+	// Use godirwalk for high-performance directory traversal
+	err := godirwalk.Walk(op.rootPath, &godirwalk.Options{
+		Callback: op.walkCallback,
+		ErrorCallback: func(osPathname string, err error) godirwalk.ErrorAction {
+			log.Warnf("Failed to access %s: %v", osPathname, err)
+			return godirwalk.SkipNode
+		},
+		Unsorted: true, // Better performance for large directories
+		FollowSymbolicLinks: op.exporter.followSymlinks,
+	})
+
+	if err != nil {
+		log.Errorf("Failed to walk directory %s: %v", op.rootPath, err)
+		return err
+	}
+
+	return nil
+}
+
+// walkCallback processes each directory entry during godirwalk traversal
+func (op *processor) walkCallback(osPathname string, de *godirwalk.Dirent) error {
+	// Calculate relative level for this path
+	relativeLevel := op.calculateRelativeLevel(osPathname)
+	
+	// Skip processing beyond maxLevel
+	if relativeLevel > op.maxLevel {
+		if de.IsDir() {
+			return godirwalk.SkipThis // Skip this directory and its children
+		}
+		return nil // Continue for files (they might contribute to parent directories)
+	}
+
+	// Check if directory should be ignored
+	if de.IsDir() {
+		dirName := filepath.Base(osPathname)
+		if op.exporter.shouldDirBeIgnored(dirName, osPathname) {
+			log.Tracef("Ignoring directory: %s", osPathname)
+			return godirwalk.SkipThis
+		}
+		
+		// Process directories only at or within maxLevel
+		op.processDirectoryLevel(osPathname, relativeLevel)
+	} else {
+		// For files, only process if we're collecting file-related metrics
+		if op.exporter.collectFileCount || op.exporter.collectSizeBucket {
+			op.processFile(osPathname, relativeLevel)
+		}
+	}
+
+	return nil
+}
+
+// processDirectory processes a directory entry and collects folder-level statistics
+func (op *processor) processDirectoryLevel(dirPath string, level int) {
+	// Skip if beyond maxLevel (double check)
+	if level > op.maxLevel {
+		log.Tracef("Skipping directory beyond maxLevel: %s (level %d > %d)", dirPath, level, op.maxLevel)
+		return
+	}
+	
+	// Get directory size using efficient method (not full recursive scan)
+	dirSize, fileCount, subDirCount := op.getDirectoryStats(dirPath)
+	
+	// Skip if we couldn't get directory stats
+	if dirSize < 0 {
+		return
+	}
+
+	op.processedDirs++
+	
+	// Create stats key for this directory/level
+	key := fmt.Sprintf("%s:%d", dirPath, level)
+	
+	// Get or create stats for this path/level
+	op.statsMutex.Lock()
+	if op.stats[key] == nil {
+		op.stats[key] = &aggregatedStats{
+			path:  dirPath,
+			level: level,
+			sizeBuckets: func() map[string]int64 {
+				if op.exporter.collectSizeBucket {
+					return make(map[string]int64)
+				}
+				return nil
+			}(),
+		}
+	}
+	stats := op.stats[key]
+	op.statsMutex.Unlock()
+
+	// Update statistics atomically
+	stats.Lock()
+	stats.totalSize += dirSize
+	if op.exporter.collectDirCount {
+		stats.directoryCount += subDirCount
+	}
+	if op.exporter.collectFileCount {
+		stats.fileCount += fileCount
+	}
+	stats.Unlock()
+
+	log.Debugf("[Level %d] Directory processed: %s (size: %d bytes, files: %d, subdirs: %d)", 
+		level, dirPath, dirSize, fileCount, subDirCount)
+}
+
+// processFile processes a file entry and accumulates file size to parent directory
+func (op *processor) processFile(filePath string, level int) {
+	op.fileCount++
+	
+	// Get file size
+	info, err := os.Stat(filePath)
+	if err != nil {
+		log.Debugf("Failed to stat file %s: %v", filePath, err)
+		return
+	}
+	
+	fileSize := info.Size()
+	parentDir := filepath.Dir(filePath)
+	parentLevel := op.calculateRelativeLevel(parentDir)
+	
+	// Skip if parent directory is beyond maxLevel
+	if parentLevel > op.maxLevel {
+		return
+	}
+	
+	// Create/update stats for parent directory
+	key := fmt.Sprintf("%s:%d", parentDir, parentLevel)
+	
+	op.statsMutex.Lock()
+	if op.stats[key] == nil {
+		op.stats[key] = &aggregatedStats{
+			path:  parentDir,
+			level: parentLevel,
+			sizeBuckets: func() map[string]int64 {
+				if op.exporter.collectSizeBucket {
+					return make(map[string]int64)
+				}
+				return nil
+			}(),
+		}
+	}
+	stats := op.stats[key]
+	op.statsMutex.Unlock()
+	
+	// Update parent directory stats with file size
+	stats.Lock()
+	stats.totalSize += fileSize
+	if op.exporter.collectFileCount {
+		stats.fileCount++
+	}
+	
+	// Process size buckets if enabled
+	if op.exporter.collectSizeBucket && stats.sizeBuckets != nil {
+		sizeRange := getSizeRange(fileSize)
+		stats.sizeBuckets[sizeRange]++
+	}
+	stats.Unlock()
+	
+	log.Tracef("File processed: %s (size: %d bytes, parent: %s, level: %d)", 
+		filePath, fileSize, parentDir, parentLevel)
+}
+
+// getDirectoryStats gets directory statistics using efficient system calls
+// This method now only provides directory-level stats without traversing all files
+func (op *processor) getDirectoryStats(dirPath string) (size int64, fileCount int64, dirCount int64) {
+	// Try to get directory info using os.Stat first
+	info, err := os.Stat(dirPath)
+	if err != nil {
+		log.Warnf("Failed to stat directory %s: %v", dirPath, err)
+		return -1, 0, 0
+	}
+
+	// Get the directory size (this is the metadata size, not content size)
+	dirMetaSize := info.Size()
+
+	// Try to get filesystem stats for better disk space calculation
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dirPath, &stat); err != nil {
+		log.Debugf("Failed to get filesystem stats for %s: %v, using fallback method", dirPath, err)
+	}
+
+	// NOTE: We rely on godirwalk to traverse files/directories
+	// This method only provides immediate directory stats
+	// File sizes and counts are accumulated through the walkCallback
+	
+	// For immediate directory stats, we do a lightweight count without full traversal
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		log.Warnf("Failed to read directory %s: %v", dirPath, err)
+		return dirMetaSize, 0, 0
+	}
+
+	var files, dirs int64
+	
+	// Quick count without processing file contents (for performance)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs++
+		} else {
+			files++
+		}
+	}
+
+	// Return directory metadata size plus approximation
+	// The actual file sizes will be accumulated by godirwalk callback
+	return dirMetaSize, files, dirs
+}
+
+// calculateRelativeLevel calculates the level relative to the root path
+func (op *processor) calculateRelativeLevel(path string) int {
+	// Clean both paths to ensure consistent comparison
+	cleanRootPath := filepath.Clean(op.rootPath)
+	cleanPath := filepath.Clean(path)
+	
+	// If the path is the same as root path, level is 0
+	if cleanPath == cleanRootPath {
+		return 0
+	}
+	
+	// Check if path is within root path
+	if !strings.HasPrefix(cleanPath, cleanRootPath+string(filepath.Separator)) {
+		// Path is not within root path, return 0 for safety
+		return 0
+	}
+	
+	// Get relative path from root
+	relativePath := strings.TrimPrefix(cleanPath, cleanRootPath+string(filepath.Separator))
+	
+	// Count directory separators to determine level
+	if relativePath == "" {
+		return 0
+	}
+	
+	level := strings.Count(relativePath, string(filepath.Separator)) + 1
+	return level
+}
+
+// getStats returns the collected statistics
+func (op *processor) getStats() map[string]*aggregatedStats {
+	op.statsMutex.Lock()
+	defer op.statsMutex.Unlock()
+
+	// Transfer ownership of stats map
+	result := op.stats
+	log.Debugf("Processor stats: %d entries, processed %d dirs", len(result), op.processedDirs)
+	op.stats = make(map[string]*aggregatedStats) // Create new empty map
+
+	return result
 }
 
 // processDirectoryStreaming performs memory-efficient directory analysis
@@ -540,7 +811,6 @@ type Exporter struct {
 	useStorage     bool
 	diskCaching    bool
 	maxProcs       int
-	chunkSize      int
 	collectDirCount    bool
 	collectFileCount   bool
 	collectSizeBucket  bool
@@ -570,17 +840,16 @@ type Exporter struct {
 // NewExporter creates new Exporter
 func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	return &Exporter{
-		followSymlinks:  followSymlinks,
-		paths:           paths,
-		stopChan:        make(chan struct{}),
-		maxProcs:        4,    // default value
-		chunkSize:       1000, // default chunk size
-		writeQueue:      make(chan writeRequest, 100), // Buffer for write requests
-		writerDone:      make(chan struct{}),
-		aggregatedStats: make(map[string]*aggregatedStats),
-		tempStats:       make(map[string]*aggregatedStats),
-		cachedStats:     make(map[string]map[string]*aggregatedStats),
-		topNLimit:       1000, // Track top 1000 largest files (only if needed)
+		followSymlinks:   followSymlinks,
+		paths:            paths,
+		stopChan:         make(chan struct{}),
+		maxProcs:         4,    // default value
+		writeQueue:       make(chan writeRequest, 100), // Buffer for write requests
+		writerDone:       make(chan struct{}),
+		aggregatedStats:  make(map[string]*aggregatedStats),
+		tempStats:        make(map[string]*aggregatedStats),
+		cachedStats:      make(map[string]map[string]*aggregatedStats),
+		topNLimit:        1000, // Track top 1000 largest files (only if needed)
 	}
 }
 
@@ -606,20 +875,13 @@ func (e *Exporter) SetMaxProcs(maxProcs int) {
 	e.maxProcs = maxProcs
 }
 
-// SetChunkSize sets the chunk size for batch processing
-func (e *Exporter) SetChunkSize(chunkSize int) {
-	if chunkSize <= 0 {
-		chunkSize = 1000 // default value
-	}
-	e.chunkSize = chunkSize
-}
-
 // SetCollectionFlags sets which metrics to collect
 func (e *Exporter) SetCollectionFlags(dirCount, fileCount, sizeBucket bool) {
 	e.collectDirCount = dirCount
 	e.collectFileCount = fileCount
 	e.collectSizeBucket = sizeBucket
 }
+
 
 // initializeSharedStorage initializes shared storage and starts writer goroutine
 func (e *Exporter) initializeSharedStorage() {
@@ -800,7 +1062,7 @@ func (e *Exporter) runBackgroundScan() {
 func (e *Exporter) performScan() {
 	defer debug.FreeOSMemory()
 
-	log.Infof("Using %d CPU cores for streaming scanning (memory-optimized)", e.maxProcs)
+	log.Infof("Using %d CPU cores for background scanning (godirwalk, folder-level processing)", e.maxProcs)
 
 	// Initialize cached stats map
 	e.mu.Lock()
@@ -809,14 +1071,14 @@ func (e *Exporter) performScan() {
 	}
 	e.mu.Unlock()
 
-	// Use streaming analysis for all paths
-	e.performStreamingAnalysis()
+	// Use analysis for all paths
+	e.performAnalysis()
 
-	log.Info("All streaming background scans completed")
+	log.Info("All background scans completed")
 }
 
-// performStreamingAnalysis performs memory-efficient streaming analysis for all paths using worker pool
-func (e *Exporter) performStreamingAnalysis() {
+// performAnalysis performs high-performance analysis for all paths using worker pool
+func (e *Exporter) performAnalysis() {
 	// Create work units for all paths
 	workUnits := make([]workUnit, 0, len(e.paths))
 	for path, maxLevel := range e.paths {
@@ -902,7 +1164,7 @@ func (e *Exporter) performStreamingAnalysis() {
 		}
 		
 		// Log scan completion time with goroutine stats
-		log.Infof("Streaming scan completed for path: %s, stats: %d, workers: %d", 
+		log.Infof("Scan completed for path: %s, stats: %d, workers: %d", 
 			path, len(result.stats), e.maxProcs)
 	}
 	
@@ -922,26 +1184,24 @@ func (e *Exporter) performStreamingAnalysis() {
 	e.setValidResults(true)
 }
 
-// streamingWorker processes work units from the work channel using streaming analysis
+// streamingWorker processes work units from the work channel using analysis
 func (e *Exporter) streamingWorker(workerID int, workChan <-chan workUnit, resultChan chan<- workResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 	
 	log.Debugf("Worker %d started", workerID)
 	
 	for unit := range workChan {
-		log.Infof("Worker %d: Starting streaming scan for path: %s (dir-level: %d)", 
+		log.Infof("Worker %d: Starting scan for path: %s (dir-level: %d)", 
 			workerID, unit.rootPath, unit.maxLevel)
 		
 		startTime := time.Now()
 		
-		// Create streaming processor for this work unit
-		processor := newStreamingProcessor(e, unit.rootPath, unit.maxLevel)
-		
-		// Perform streaming analysis
-		err := processor.processDirectoryStreaming()
+		// Use godirwalk processor
+		processor := newProcessor(e, unit.rootPath, unit.maxLevel)
+		err := processor.processDirectory()
 		var stats map[string]*aggregatedStats
 		if err == nil {
-			stats = processor.getStreamingStats()
+			stats = processor.getStats()
 		}
 		
 		// Send result
@@ -952,7 +1212,7 @@ func (e *Exporter) streamingWorker(workerID int, workChan <-chan workUnit, resul
 		}
 		
 		elapsed := time.Since(startTime)
-		log.Infof("Worker %d: Completed streaming scan for path: %s, elapsed: %v, stats: %d", 
+		log.Infof("Worker %d: Completed scan for path: %s, elapsed: %v, stats: %d", 
 			workerID, unit.rootPath, elapsed, len(stats))
 	}
 	
@@ -1095,23 +1355,23 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 func (e *Exporter) runAnalysis() {
 	defer debug.FreeOSMemory()
 
-	log.Infof("Using %d CPU cores for live streaming analysis (memory-optimized)", e.maxProcs)
+	log.Infof("Using %d CPU cores for live analysis (godirwalk, folder-level processing)", e.maxProcs)
 
 	// Set scanning state
 	e.setScanningState(true)
 	defer e.setScanningState(false)
 
-	// Use streaming analysis for live results
-	e.performLiveStreamingAnalysis()
+	// Use analysis for live results
+	e.performLiveAnalysis()
 
 	// Mark that we have valid results
 	e.setValidResults(true)
 
-	log.Info("All live streaming analysis completed")
+	log.Info("All live analysis completed")
 }
 
-// performLiveStreamingAnalysis performs live streaming analysis for immediate results
-func (e *Exporter) performLiveStreamingAnalysis() {
+// performLiveAnalysis performs live analysis for immediate results
+func (e *Exporter) performLiveAnalysis() {
 	// Temporary stats for live analysis
 	tempStats := make(map[string]map[string]*aggregatedStats)
 	var tempMutex sync.RWMutex
@@ -1119,7 +1379,7 @@ func (e *Exporter) performLiveStreamingAnalysis() {
 	// Use WaitGroup for parallel analysis
 	var wg sync.WaitGroup
 	
-	// Start parallel streaming analysis for each path
+	// Start parallel analysis for each path
 	for path := range e.paths {
 		wg.Add(1)
 		go func(path string) {
@@ -1131,26 +1391,26 @@ func (e *Exporter) performLiveStreamingAnalysis() {
 			if maxLevel < 0 {
 				maxLevel = 0
 			}
-			log.Debugf("Starting live streaming scan for path: %s (dir-level: %d)", path, maxLevel)
+			log.Debugf("Starting live scan for path: %s (dir-level: %d)", path, maxLevel)
 			
-			// Create streaming processor for this path
-			processor := newStreamingProcessor(e, path, maxLevel)
-			
-			// Perform streaming analysis
-			err := processor.processDirectoryStreaming()
-			if err != nil {
-				log.Warnf("Live streaming scan failed for path %s: %v", path, err)
-				return
+			// Use godirwalk processor
+			processor := newProcessor(e, path, maxLevel)
+			err := processor.processDirectory()
+			var stats map[string]*aggregatedStats
+			if err == nil {
+				stats = processor.getStats()
 			}
 			
-			// Get results and store in temp stats
-			stats := processor.getStreamingStats()
+			if err != nil {
+				log.Warnf("Live scan failed for path %s: %v", path, err)
+				return
+			}
 			tempMutex.Lock()
 			tempStats[path] = stats
 			tempMutex.Unlock()
 			
 			elapsedTime := time.Since(startTime)
-			log.Debugf("Live streaming scan completed for path: %s, elapsed time: %v, stats: %d", 
+			log.Debugf("Live scan completed for path: %s, elapsed time: %v, stats: %d", 
 				path, elapsedTime, len(stats))
 		}(path)
 	}
@@ -1171,7 +1431,7 @@ func (e *Exporter) performLiveStreamingAnalysis() {
 	// Publish the live results
 	e.publishAggregatedMetrics()
 	
-	log.Debugf("Live streaming analysis results published with %d total stats", len(e.aggregatedStats))
+	log.Debugf("Live analysis results published with %d total stats", len(e.aggregatedStats))
 }
 
 // runAnalysisAsync runs analysis in background without blocking
@@ -1616,6 +1876,23 @@ func (e *Exporter) publishCachedStats(pathStats map[string]*aggregatedStats) {
 		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
 		
+		// Check if this stats entry should be published based on path maxLevel
+		shouldPublish := false
+		for rootPath, maxLevel := range e.paths {
+			if strings.HasPrefix(stats.path, rootPath) || stats.path == rootPath {
+				if stats.level <= maxLevel {
+					shouldPublish = true
+				}
+				break
+			}
+		}
+		
+		if !shouldPublish {
+			log.Tracef("Skipping cached stats publication for %s:level%d (beyond configured maxLevel)", stats.path, stats.level)
+			stats.Unlock()
+			continue
+		}
+		
 		// Always publish total disk usage metric
 		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
 		
@@ -1651,9 +1928,27 @@ func (e *Exporter) publishAggregatedMetrics() {
 	e.statsMutex.RLock()
 	defer e.statsMutex.RUnlock()
 	
+	// Filter stats by configured maxLevel for each path
 	for _, stats := range e.aggregatedStats {
 		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
+		
+		// Check if this stats entry should be published based on path maxLevel
+		shouldPublish := false
+		for rootPath, maxLevel := range e.paths {
+			if strings.HasPrefix(stats.path, rootPath) || stats.path == rootPath {
+				if stats.level <= maxLevel {
+					shouldPublish = true
+				}
+				break
+			}
+		}
+		
+		if !shouldPublish {
+			log.Tracef("Skipping stats publication for %s:level%d (beyond configured maxLevel)", stats.path, stats.level)
+			stats.Unlock()
+			continue
+		}
 		
 		// Always publish total disk usage metric
 		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
@@ -1667,13 +1962,11 @@ func (e *Exporter) publishAggregatedMetrics() {
 			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
 		}
 		
-		if e.collectSizeBucket {
+		if e.collectSizeBucket && stats.sizeBuckets != nil {
 			for sizeRange, count := range stats.sizeBuckets {
 				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 			}
 		}
-		
-		// Total disk usage metric is published above
 		
 		stats.Unlock()
 	}

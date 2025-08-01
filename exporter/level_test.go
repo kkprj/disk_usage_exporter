@@ -30,7 +30,7 @@ import (
 func TestLevelCalculation(t *testing.T) {
 	// Create a streaming processor for testing
 	rootPath := "/tmp/test-level-root"
-	processor := &streamingProcessor{
+	processor := &processor{
 		rootPath: rootPath,
 		maxLevel: 3,
 		stats:    make(map[string]*aggregatedStats),
@@ -365,7 +365,7 @@ func TestLevelCalculationEdgeCases(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			processor := &streamingProcessor{
+			processor := &processor{
 				rootPath: tc.rootPath,
 				maxLevel: 5,
 				stats:    make(map[string]*aggregatedStats),
