@@ -69,7 +69,7 @@ func TestLevelConstraintWithDeepFiles(t *testing.T) {
 	registry.MustRegister(diskUsage)
 
 	// Perform scan using streaming analysis
-	exporter.performStreamingAnalysis()
+	exporter.performLiveAnalysis()
 
 	// Gather metrics
 	metricFamilies, err := registry.Gather()
@@ -225,7 +225,7 @@ func TestLevelConstraintComparisonBefore(t *testing.T) {
 			exporter.SetCollectionFlags(false, false, false)
 
 			registry.MustRegister(diskUsage)
-			exporter.performStreamingAnalysis()
+			exporter.performLiveAnalysis()
 
 			metricFamilies, err := registry.Gather()
 			if err != nil {

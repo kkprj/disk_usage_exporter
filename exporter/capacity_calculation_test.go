@@ -123,7 +123,7 @@ func TestDirectoryCapacityCalculation(t *testing.T) {
 			registry.MustRegister(diskUsage)
 
 			// Perform scan - use streaming analysis which is the current implementation
-			exporter.performStreamingAnalysis()
+			exporter.performLiveAnalysis()
 
 			// Gather metrics
 			metricFamilies, err := registry.Gather()
@@ -222,7 +222,7 @@ func TestHierarchicalSizeInheritance(t *testing.T) {
 	exporter.SetCollectionFlags(false, false, false)
 
 	registry.MustRegister(diskUsage)
-	exporter.performStreamingAnalysis()
+	exporter.performLiveAnalysis()
 
 	metricFamilies, err := registry.Gather()
 	if err != nil {

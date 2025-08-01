@@ -7,7 +7,7 @@
 ## 주요 특징
 
 - **고정된 Worker 수**: `max-procs` 설정값에 따라 고정된 수의 Go 루틴 운영
-- **메모리 제어**: `chunk-size` 설정을 통한 각 Worker의 메모리 사용량 제어
+- **메모리 제어**: godirwalk를 통한 효율적인 메모리 사용
 - **스트리밍 처리**: 대용량 디렉토리 구조를 메모리 효율적으로 처리
 - **레벨 제한**: `dir-level` 설정에 따른 스캔 깊이 제한
 
@@ -83,9 +83,8 @@ flowchart TD
     G -->|Yes| H[디렉토리 엔트리 읽기]
     
     H --> I[Batch 처리]
-    I --> J{Batch 크기가 chunkSize에 도달?}
-    J -->|Yes| K[Batch 처리 및 메모리 정리]
-    J -->|No| L[다음 엔트리]
+    I --> K[godirwalk 콜백 처리]
+    K --> L[다음 엔트리]
     
     K --> L
     L --> N{더 많은 엔트리?}
@@ -108,7 +107,7 @@ graph TD
         SP3[maxLevel int]
         SP4[stats map[string]*aggregatedStats]
         SP5[statsMutex sync.RWMutex]
-        SP6[batchSize int = chunkSize]
+        SP6[godirwalk 콜백 처리]
         SP7[currentBatch []streamingItem]
     end
     
@@ -136,9 +135,6 @@ graph TD
 # CPU 코어 설정 - Worker 수 결정
 max-procs: 12
 
-# 청크 크기 설정 - 각 Worker의 메모리 사용량 제어
-chunk-size: 1000
-
 # 디렉토리 레벨 제한
 dir-level: 3
 ```
@@ -146,19 +142,18 @@ dir-level: 3
 ### 설정 설명
 
 - **max-procs**: 동시에 실행될 Worker의 수를 결정
-- **chunk-size**: 각 Worker가 한 번에 처리할 파일/디렉토리 수 (메모리 사용량 제어)
 - **dir-level**: 스캔할 디렉토리 깊이 제한
 
 ## 메모리 최적화 전략
 
-### 1. 배치 처리
+### 1. godirwalk 기반 처리
 ```go
-// 설정된 chunk-size만큼 처리 후 즉시 메모리 정리
-if len(sp.currentBatch) >= sp.batchSize {
-    sp.processBatch()  // 통계 집계
-    sp.currentBatch = sp.currentBatch[:0]  // 슬라이스 초기화
-    runtime.GC()  // 가비지 컬렉션 제안
-}
+// godirwalk 콜백을 통한 효율적인 디렉토리 순회
+return godirwalk.Walk(op.rootPath, &godirwalk.Options{
+    Callback: op.walkCallback,
+    Unsorted: true, // Better performance for large directories
+    FollowSymbolicLinks: op.exporter.followSymlinks,
+})
 ```
 
 ### 2. 조기 종료
@@ -203,13 +198,13 @@ for i := 0; i < e.maxProcs; i++ {
 | 항목 | 기존 방식 | Worker Pool 방식 |
 |------|-----------|------------------|
 | Go 루틴 수 | 스캔 경로 수만큼 | max-procs 개수 고정 |
-| 메모리 사용량 | 전체 디렉토리 구조 | chunk-size로 제어 |
+| 메모리 사용량 | 전체 디렉토리 구조 | godirwalk로 최적화 |
 | CPU 사용량 | 제어 불가능 | max-procs로 제어 |
 | 확장성 | 경로 수에 비례 | 설정으로 제어 가능 |
 
-### 메모리 사용량 계산
+### 메모리 사용량 특성
 ```
-예상 메모리 사용량 = max-procs × chunk-size × 평균_아이템_크기
+최적화된 메모리 사용량 = max-procs × godirwalk 콜백 처리 비용
 ```
 
 ## 사용 예시
@@ -217,21 +212,21 @@ for i := 0; i < e.maxProcs; i++ {
 ### 설정 예시 1: 고성능 서버
 ```yaml
 max-procs: 16      # 16개 Worker
-chunk-size: 2000   # 높은 처리량
+# godirwalk 기반 고성능 처리
 dir-level: 4       # 깊은 스캔
 ```
 
 ### 설정 예시 2: 메모리 제한 환경
 ```yaml
 max-procs: 4       # 4개 Worker
-chunk-size: 500    # 낮은 메모리 사용량
+# godirwalk 기반 메모리 효율적 처리
 dir-level: 2       # 얕은 스캔
 ```
 
 ### 설정 예시 3: 균형 잡힌 설정
 ```yaml
 max-procs: 8       # 8개 Worker
-chunk-size: 1000   # 기본값
+# godirwalk 기반 균형 잡힌 처리
 dir-level: 3       # 중간 깊이
 ```
 
@@ -251,9 +246,9 @@ dir-level: 3       # 중간 깊이
 
 Worker Pool 기반 아키텍처는 다음과 같은 이점을 제공합니다:
 
-1. **예측 가능한 리소스 사용**: max-procs와 chunk-size로 CPU와 메모리 사용량 제어
+1. **예측 가능한 리소스 사용**: max-procs로 CPU 사용량 제어, godirwalk로 메모리 최적화
 2. **확장성**: 시스템 리소스에 맞춰 설정 조정 가능
-3. **메모리 효율성**: 스트리밍 처리와 배치 정리를 통한 메모리 최적화
+3. **메모리 효율성**: godirwalk 콜백 처리를 통한 메모리 최적화
 4. **안정성**: 고정된 Worker 수로 시스템 안정성 향상
 
 이 아키텍처를 통해 대용량 디렉토리 구조도 메모리 효율적으로 스캔할 수 있습니다.

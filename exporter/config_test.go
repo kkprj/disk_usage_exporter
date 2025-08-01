@@ -16,42 +16,36 @@ func TestConfigVariations(t *testing.T) {
 	tests := []struct {
 		name      string
 		dirLevel  int
-		chunkSize int
 		maxProcs  int
 		testPath  string
 	}{
 		{
-			name:      "DirLevel1_Chunk500_Procs1",
+			name:      "DirLevel1_Procs1",
 			dirLevel:  1,
-			chunkSize: 500,
 			maxProcs:  1,
 			testPath:  "/tmp/test-complex",
 		},
 		{
-			name:      "DirLevel2_Chunk500_Procs6",
+			name:      "DirLevel2_Procs6",
 			dirLevel:  2,
-			chunkSize: 500,
 			maxProcs:  6,
 			testPath:  "/tmp/test-complex",
 		},
 		{
-			name:      "DirLevel3_Chunk500_Procs12",
+			name:      "DirLevel3_Procs12",
 			dirLevel:  3,
-			chunkSize: 500,
 			maxProcs:  12,
 			testPath:  "/tmp/test-complex",
 		},
 		{
-			name:      "DirLevel2_Chunk1000_Procs6",
+			name:      "DirLevel2_Procs6_v2",
 			dirLevel:  2,
-			chunkSize: 1000,
 			maxProcs:  6,
 			testPath:  "/tmp/test-complex",
 		},
 		{
-			name:      "DirLevel3_Chunk1000_Procs12",
+			name:      "DirLevel3_Procs12_v2",
 			dirLevel:  3,
-			chunkSize: 1000,
 			maxProcs:  12,
 			testPath:  "/tmp/test-complex",
 		},
@@ -66,7 +60,6 @@ func TestConfigVariations(t *testing.T) {
 			pathMap := map[string]int{tt.testPath: tt.dirLevel}
 			exporter := NewExporter(pathMap, false)
 			exporter.SetMaxProcs(tt.maxProcs)
-			exporter.SetChunkSize(tt.chunkSize)
 			exporter.SetCollectionFlags(false, false, true) // Only size buckets enabled
 			
 			// Register metrics with test registry
@@ -126,8 +119,8 @@ func TestConfigVariations(t *testing.T) {
 				t.Errorf("Expected at least %d disk usage metrics, got %d", expectedMinMetrics, diskUsageCount)
 			}
 			
-			t.Logf("Test %s completed successfully - DirLevel:%d, ChunkSize:%d, MaxProcs:%d, DiskUsage:%d, SizeBucket:%d",
-				tt.name, tt.dirLevel, tt.chunkSize, tt.maxProcs, diskUsageCount, sizeBucketCount)
+			t.Logf("Test %s completed successfully - DirLevel:%d, MaxProcs:%d, DiskUsage:%d, SizeBucket:%d",
+				tt.name, tt.dirLevel, tt.maxProcs, diskUsageCount, sizeBucketCount)
 		})
 	}
 }
@@ -150,7 +143,6 @@ func TestDirLevelConstraints(t *testing.T) {
 			pathMap := map[string]int{"/tmp/test-complex": tc.dirLevel}
 			exporter := NewExporter(pathMap, false)
 			exporter.SetMaxProcs(6)
-			exporter.SetChunkSize(1000)
 			exporter.SetCollectionFlags(false, false, true)
 			
 			registry.MustRegister(diskUsage, diskUsageSizeBucket)
@@ -192,47 +184,6 @@ func TestDirLevelConstraints(t *testing.T) {
 	}
 }
 
-// TestChunkSizePerformance tests different chunk sizes for performance
-func TestChunkSizePerformance(t *testing.T) {
-	chunkSizes := []int{500, 1000}
-	
-	for _, chunkSize := range chunkSizes {
-		t.Run(fmt.Sprintf("ChunkSize_%d", chunkSize), func(t *testing.T) {
-			registry := prometheus.NewRegistry()
-			
-			pathMap := map[string]int{"/tmp/test-complex": 3}
-			exporter := NewExporter(pathMap, false)
-			exporter.SetMaxProcs(6)
-			exporter.SetChunkSize(chunkSize)
-			exporter.SetCollectionFlags(false, false, true)
-			
-			registry.MustRegister(diskUsage, diskUsageSizeBucket)
-			
-			start := time.Now()
-			exporter.performScan()
-			elapsed := time.Since(start)
-			
-			metricFamilies, err := registry.Gather()
-			if err != nil {
-				t.Fatalf("Failed to gather metrics: %v", err)
-			}
-			
-			var metricCount int
-			for _, mf := range metricFamilies {
-				if *mf.Name == "node_disk_usage" || *mf.Name == "node_disk_usage_size_bucket" {
-					metricCount += len(mf.Metric)
-				}
-			}
-			
-			t.Logf("ChunkSize %d: %d metrics generated in %v", chunkSize, metricCount, elapsed)
-			
-			if metricCount == 0 {
-				t.Error("No metrics generated")
-			}
-		})
-	}
-}
-
 // TestMaxProcsScaling tests different max-procs settings
 func TestMaxProcsScaling(t *testing.T) {
 	maxProcsList := []int{1, 6, 12}
@@ -244,7 +195,6 @@ func TestMaxProcsScaling(t *testing.T) {
 			pathMap := map[string]int{"/tmp/test-complex": 3}
 			exporter := NewExporter(pathMap, false)
 			exporter.SetMaxProcs(maxProcs)
-			exporter.SetChunkSize(1000)
 			exporter.SetCollectionFlags(false, false, true)
 			
 			registry.MustRegister(diskUsage, diskUsageSizeBucket)
