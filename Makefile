@@ -16,11 +16,21 @@ run:
 build:
 	@echo "Version: " $(VERSION)
 	mkdir -p dist
-	GOFLAGS="$(GOFLAGS)" CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o dist/$(NAME) .
+	GOFLAGS="$(GOFLAGS)" CGO_ENABLED=1 go build -ldflags="$(LDFLAGS)" -o dist/$(NAME) .
+
+build-static:
+	@echo "Version: " $(VERSION) " (Static build without SQLite)"
+	mkdir -p dist
+	GOFLAGS="$(GOFLAGS)" CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -o dist/$(NAME)-static .
 
 build-all:
 	@echo "Version: " $(VERSION)
 	-mkdir dist
+	
+	# Build SQLite-enabled version for current platform
+	CGO_ENABLED=1 go build -ldflags="$(LDFLAGS)" -o dist/disk_usage_exporter_sqlite .
+	
+	# Build static versions (without SQLite) for cross-compilation
 	-CGO_ENABLED=0 gox \
 		-os="darwin" \
 		-arch="amd64 arm64" \

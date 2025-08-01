@@ -3,3 +3,6 @@
 /vendor
 /disk_usage_exporter
 /*.log
+/*.db
+/*.db-shm
+/*.db-wal

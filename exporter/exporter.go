@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/dundee/disk_usage_exporter/build"
+	"github.com/dundee/disk_usage_exporter/storage"
 	"github.com/dundee/gdu/v5/pkg/analyze"
 	"github.com/dundee/gdu/v5/pkg/fs"
 	"github.com/karrick/godirwalk"
@@ -39,7 +40,7 @@ var (
 		},
 		[]string{"path", "level"},
 	)
-	
+
 	// 디스크 사용량 메트릭
 	diskUsage = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -48,7 +49,7 @@ var (
 		},
 		[]string{"path", "level"},
 	)
-	
+
 	// 크기별 버킷 메트릭
 	diskUsageSizeBucket = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -57,7 +58,7 @@ var (
 		},
 		[]string{"path", "size_range", "level"},
 	)
-	
+
 	// Top-N 파일 메트릭
 	diskUsageTopFiles = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -80,7 +81,7 @@ var (
 		},
 		[]string{"path"},
 	)
-	
+
 	collectors = []prometheus.Collector{
 		diskUsageFileCount, diskUsageDirectoryCount,
 		diskUsage, diskUsageSizeBucket, diskUsageTopFiles,
@@ -100,11 +101,11 @@ type aggregatedStats struct {
 	sync.Mutex
 	path           string
 	level          int
-	totalSize      int64             // total size for by_type metric
+	totalSize      int64 // total size for by_type metric
 	fileCount      int64
 	directoryCount int64
-	sizeBuckets    map[string]int64  // size_range -> count
-	topFiles       []topFileInfo     // largest files
+	sizeBuckets    map[string]int64 // size_range -> count
+	topFiles       []topFileInfo    // largest files
 	othersTotal    int64
 	othersCount    int64
 }
@@ -117,27 +118,18 @@ type topFileInfo struct {
 }
 
 // getSizeRange returns the size range bucket for a given file size
+// Deprecated: Use storage.GetSizeRange instead
 func getSizeRange(size int64) string {
-	if size == 0 {
-		return "0B"
-	} else if size <= 1024 {
-		return "0-1KB"
-	} else if size <= 1024*1024 {
-		return "1KB-1MB"
-	} else if size <= 100*1024*1024 {
-		return "1MB-100MB"
-	} else {
-		return "100MB+"
-	}
+	return storage.GetSizeRange(size)
 }
 
 // streamingItem represents a lightweight file system item for streaming processing
 type streamingItem struct {
-	path     string
-	size     int64
-	isDir    bool
-	level    int
-	modTime  time.Time
+	path    string
+	size    int64
+	isDir   bool
+	level   int
+	modTime time.Time
 }
 
 // workUnit represents a unit of work for the worker pool
@@ -168,33 +160,48 @@ type streamingProcessor struct {
 
 // processor handles high-performance folder-level directory traversal using godirwalk
 type processor struct {
-	exporter     *Exporter
-	rootPath     string
-	maxLevel     int
-	stats        map[string]*aggregatedStats
-	statsMutex   sync.RWMutex
-	fileCount    int64
-	dirCount     int64
+	exporter      *Exporter
+	rootPath      string
+	maxLevel      int
+	storage       storage.Storage
+	batchBuffer   []storage.DiskStat
+	batchSize     int
+	batchMutex    sync.Mutex
+	fileCount     int64
+	dirCount      int64
 	processedDirs int64
 }
 
-
 // newProcessor creates a new processor using godirwalk
 func newProcessor(exporter *Exporter, rootPath string, maxLevel int) *processor {
-	return &processor{
-		exporter:     exporter,
-		rootPath:     rootPath,
-		maxLevel:     maxLevel,
-		stats:        make(map[string]*aggregatedStats),
+	p := &processor{
+		exporter: exporter,
+		rootPath: rootPath,
+		maxLevel: maxLevel,
 	}
+	
+	// Configure storage and batch settings if exporter is available
+	if exporter != nil {
+		p.storage = exporter.sqliteStorage
+		p.batchSize = exporter.batchSize
+		p.batchBuffer = make([]storage.DiskStat, 0, exporter.batchSize)
+	} else {
+		// Testing mode - no storage, default batch size
+		p.batchSize = 1000
+		p.batchBuffer = make([]storage.DiskStat, 0, 1000)
+	}
+	
+	return p
 }
 
 // processDirectory performs high-performance folder-level directory analysis using godirwalk
 func (op *processor) processDirectory() error {
 	log.Debugf("Starting analysis for path: %s (maxLevel: %d)", op.rootPath, op.maxLevel)
 	defer func() {
+		// Flush any remaining batch data
+		op.flushBatch()
 		runtime.GC()
-		log.Debugf("Completed analysis for path: %s (dirs processed: %d, files: %d)", 
+		log.Debugf("Completed analysis for path: %s (dirs processed: %d, files: %d)",
 			op.rootPath, op.processedDirs, op.fileCount)
 	}()
 
@@ -205,7 +212,7 @@ func (op *processor) processDirectory() error {
 			log.Warnf("Failed to access %s: %v", osPathname, err)
 			return godirwalk.SkipNode
 		},
-		Unsorted: true, // Better performance for large directories
+		Unsorted:            true, // Better performance for large directories
 		FollowSymbolicLinks: op.exporter.followSymlinks,
 	})
 
@@ -221,7 +228,7 @@ func (op *processor) processDirectory() error {
 func (op *processor) walkCallback(osPathname string, de *godirwalk.Dirent) error {
 	// Calculate relative level for this path
 	relativeLevel := op.calculateRelativeLevel(osPathname)
-	
+
 	// Skip processing beyond maxLevel
 	if relativeLevel > op.maxLevel {
 		if de.IsDir() {
@@ -237,7 +244,7 @@ func (op *processor) walkCallback(osPathname string, de *godirwalk.Dirent) error
 			log.Tracef("Ignoring directory: %s", osPathname)
 			return godirwalk.SkipThis
 		}
-		
+
 		// Process directories only at or within maxLevel
 		op.processDirectoryLevel(osPathname, relativeLevel)
 	} else {
@@ -250,114 +257,130 @@ func (op *processor) walkCallback(osPathname string, de *godirwalk.Dirent) error
 	return nil
 }
 
-// processDirectory processes a directory entry and collects folder-level statistics
+// processDirectoryLevel processes a directory entry and collects folder-level statistics
 func (op *processor) processDirectoryLevel(dirPath string, level int) {
 	// Skip if beyond maxLevel (double check)
 	if level > op.maxLevel {
 		log.Tracef("Skipping directory beyond maxLevel: %s (level %d > %d)", dirPath, level, op.maxLevel)
 		return
 	}
-	
+
 	// Get directory size using efficient method (not full recursive scan)
 	dirSize, fileCount, subDirCount := op.getDirectoryStats(dirPath)
-	
+
 	// Skip if we couldn't get directory stats
 	if dirSize < 0 {
 		return
 	}
 
 	op.processedDirs++
-	
-	// Create stats key for this directory/level
-	key := fmt.Sprintf("%s:%d", dirPath, level)
-	
-	// Get or create stats for this path/level
-	op.statsMutex.Lock()
-	if op.stats[key] == nil {
-		op.stats[key] = &aggregatedStats{
-			path:  dirPath,
-			level: level,
-			sizeBuckets: func() map[string]int64 {
-				if op.exporter.collectSizeBucket {
-					return make(map[string]int64)
-				}
-				return nil
-			}(),
-		}
-	}
-	stats := op.stats[key]
-	op.statsMutex.Unlock()
 
-	// Update statistics atomically
-	stats.Lock()
-	stats.totalSize += dirSize
+	// Create DiskStat for batch processing
+	stat := storage.NewDiskStat(dirPath, level)
+	stat.Size = dirSize
+
 	if op.exporter.collectDirCount {
-		stats.directoryCount += subDirCount
+		stat.DirCount = subDirCount
 	}
 	if op.exporter.collectFileCount {
-		stats.fileCount += fileCount
+		stat.FileCount = fileCount
 	}
-	stats.Unlock()
 
-	log.Debugf("[Level %d] Directory processed: %s (size: %d bytes, files: %d, subdirs: %d)", 
+	// Add to batch buffer
+	op.addToBatch(stat)
+
+	log.Debugf("[Level %d] Directory processed: %s (size: %d bytes, files: %d, subdirs: %d)",
 		level, dirPath, dirSize, fileCount, subDirCount)
 }
 
 // processFile processes a file entry and accumulates file size to parent directory
 func (op *processor) processFile(filePath string, level int) {
 	op.fileCount++
-	
+
 	// Get file size
 	info, err := os.Stat(filePath)
 	if err != nil {
 		log.Debugf("Failed to stat file %s: %v", filePath, err)
 		return
 	}
-	
+
 	fileSize := info.Size()
 	parentDir := filepath.Dir(filePath)
 	parentLevel := op.calculateRelativeLevel(parentDir)
-	
+
 	// Skip if parent directory is beyond maxLevel
 	if parentLevel > op.maxLevel {
 		return
 	}
-	
-	// Create/update stats for parent directory
-	key := fmt.Sprintf("%s:%d", parentDir, parentLevel)
-	
-	op.statsMutex.Lock()
-	if op.stats[key] == nil {
-		op.stats[key] = &aggregatedStats{
-			path:  parentDir,
-			level: parentLevel,
-			sizeBuckets: func() map[string]int64 {
-				if op.exporter.collectSizeBucket {
-					return make(map[string]int64)
-				}
-				return nil
-			}(),
+
+	// Create DiskStat for parent directory
+	stat := storage.NewDiskStat(parentDir, parentLevel)
+	stat.Size = fileSize
+
+	if op.exporter.collectFileCount {
+		stat.FileCount = 1
+	}
+
+	// Process size buckets if enabled
+	if op.exporter.collectSizeBucket {
+		sizeRange := storage.GetSizeRange(fileSize)
+		stat.SizeBuckets[sizeRange] = 1
+	}
+
+	// Add to batch buffer
+	op.addToBatch(stat)
+
+	log.Tracef("File processed: %s (size: %d bytes, parent: %s, level: %d)",
+		filePath, fileSize, parentDir, parentLevel)
+}
+
+// addToBatch adds a DiskStat to the batch buffer and triggers batch processing when full
+func (op *processor) addToBatch(stat *storage.DiskStat) {
+	op.batchMutex.Lock()
+	defer op.batchMutex.Unlock()
+
+	op.batchBuffer = append(op.batchBuffer, *stat)
+
+	// Process batch when it reaches configured size
+	if len(op.batchBuffer) >= op.batchSize {
+		op.processBatchLocked()
+	}
+}
+
+// processBatchLocked processes the current batch and clears memory (assumes mutex is held)
+func (op *processor) processBatchLocked() {
+	if len(op.batchBuffer) == 0 {
+		return
+	}
+
+	// Store batch to SQLite with transaction handling
+	if op.storage != nil {
+		if err := op.storage.StoreBatch(op.batchBuffer); err != nil {
+			log.Errorf("Failed to store batch to SQLite: %v", err)
+		} else {
+			log.Debugf("Successfully stored batch of %d records to SQLite", len(op.batchBuffer))
 		}
 	}
-	stats := op.stats[key]
-	op.statsMutex.Unlock()
-	
-	// Update parent directory stats with file size
-	stats.Lock()
-	stats.totalSize += fileSize
-	if op.exporter.collectFileCount {
-		stats.fileCount++
+
+	// Clear batch buffer and trigger memory cleanup
+	op.batchBuffer = op.batchBuffer[:0] // Reset slice but keep capacity
+	runtime.GC()                        // Suggest garbage collection to free memory
+}
+
+// flushBatch processes any remaining items in the batch buffer
+func (op *processor) flushBatch() {
+	// Skip if no storage available (testing mode)
+	if op.storage == nil {
+		return
 	}
 	
-	// Process size buckets if enabled
-	if op.exporter.collectSizeBucket && stats.sizeBuckets != nil {
-		sizeRange := getSizeRange(fileSize)
-		stats.sizeBuckets[sizeRange]++
+	op.batchMutex.Lock()
+	defer op.batchMutex.Unlock()
+
+	if len(op.batchBuffer) > 0 {
+		log.Debugf("Flushing remaining batch of %d records", len(op.batchBuffer))
+		op.processBatchLocked()
 	}
-	stats.Unlock()
-	
-	log.Tracef("File processed: %s (size: %d bytes, parent: %s, level: %d)", 
-		filePath, fileSize, parentDir, parentLevel)
 }
 
 // getDirectoryStats gets directory statistics using efficient system calls
@@ -382,7 +405,7 @@ func (op *processor) getDirectoryStats(dirPath string) (size int64, fileCount in
 	// NOTE: We rely on godirwalk to traverse files/directories
 	// This method only provides immediate directory stats
 	// File sizes and counts are accumulated through the walkCallback
-	
+
 	// For immediate directory stats, we do a lightweight count without full traversal
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
@@ -391,7 +414,7 @@ func (op *processor) getDirectoryStats(dirPath string) (size int64, fileCount in
 	}
 
 	var files, dirs int64
-	
+
 	// Quick count without processing file contents (for performance)
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -411,40 +434,81 @@ func (op *processor) calculateRelativeLevel(path string) int {
 	// Clean both paths to ensure consistent comparison
 	cleanRootPath := filepath.Clean(op.rootPath)
 	cleanPath := filepath.Clean(path)
-	
+
 	// If the path is the same as root path, level is 0
 	if cleanPath == cleanRootPath {
 		return 0
 	}
-	
+
 	// Check if path is within root path
 	if !strings.HasPrefix(cleanPath, cleanRootPath+string(filepath.Separator)) {
 		// Path is not within root path, return 0 for safety
 		return 0
 	}
-	
+
 	// Get relative path from root
 	relativePath := strings.TrimPrefix(cleanPath, cleanRootPath+string(filepath.Separator))
-	
+
 	// Count directory separators to determine level
 	if relativePath == "" {
 		return 0
 	}
-	
+
 	level := strings.Count(relativePath, string(filepath.Separator)) + 1
 	return level
 }
 
-// getStats returns the collected statistics
+// getStats returns the collected statistics from SQLite storage
 func (op *processor) getStats() map[string]*aggregatedStats {
-	op.statsMutex.Lock()
-	defer op.statsMutex.Unlock()
+	// If storage is not available (testing mode), return empty map
+	if op.storage == nil {
+		log.Debugf("No storage available, returning empty stats (testing mode)")
+		return make(map[string]*aggregatedStats)
+	}
+	
+	// Ensure all data is flushed to storage
+	op.flushBatch()
 
-	// Transfer ownership of stats map
-	result := op.stats
-	log.Debugf("Processor stats: %d entries, processed %d dirs", len(result), op.processedDirs)
-	op.stats = make(map[string]*aggregatedStats) // Create new empty map
+	// Retrieve data from SQLite storage
+	paths := map[string]int{op.rootPath: op.maxLevel}
+	diskStats, err := op.storage.GetMetricsData(paths)
+	if err != nil {
+		log.Errorf("Failed to retrieve stats from SQLite: %v", err)
+		return make(map[string]*aggregatedStats)
+	}
 
+	// Convert DiskStat to aggregatedStats for compatibility
+	result := make(map[string]*aggregatedStats)
+	for _, stat := range diskStats {
+		key := fmt.Sprintf("%s:%d", stat.Path, stat.Level)
+
+		aggregated := &aggregatedStats{
+			path:           stat.Path,
+			level:          stat.Level,
+			totalSize:      stat.Size,
+			fileCount:      stat.FileCount,
+			directoryCount: stat.DirCount,
+			sizeBuckets:    stat.SizeBuckets,
+			othersTotal:    stat.OthersTotal,
+			othersCount:    stat.OthersCount,
+		}
+
+		// Convert TopFileInfo to topFileInfo
+		if len(stat.TopFiles) > 0 {
+			aggregated.topFiles = make([]topFileInfo, len(stat.TopFiles))
+			for i, tf := range stat.TopFiles {
+				aggregated.topFiles[i] = topFileInfo{
+					path: tf.Path,
+					size: tf.Size,
+					rank: tf.Rank,
+				}
+			}
+		}
+
+		result[key] = aggregated
+	}
+
+	log.Debugf("Processor stats: %d entries retrieved from SQLite, processed %d dirs", len(result), op.processedDirs)
 	return result
 }
 
@@ -467,7 +531,7 @@ func (sp *streamingProcessor) processDirectoryStreaming() error {
 func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level int) error {
 	// Calculate relative level for this directory
 	relativeLevel := sp.calculateRelativeLevel(dirPath)
-	
+
 	// Continue scanning beyond maxLevel for files, but don't create directory metrics
 	scanForFilesOnly := relativeLevel > sp.maxLevel
 	if scanForFilesOnly {
@@ -537,7 +601,7 @@ func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level i
 		sp.processBatch()
 	}
 
-	log.Debugf("[Level %d] Completed scan: %s (dirs: %d, files: %d, processed: %d)", 
+	log.Debugf("[Level %d] Completed scan: %s (dirs: %d, files: %d, processed: %d)",
 		level, dirPath, dirCount, fileCount, processedCount)
 
 	// Recursively process subdirectories only if within level limit
@@ -545,7 +609,7 @@ func (sp *streamingProcessor) traverseDirectoryStreaming(dirPath string, level i
 	for _, entry := range entries {
 		if entry.IsDir() {
 			subDirPath := filepath.Join(dirPath, entry.Name())
-			
+
 			// Always traverse subdirectories to find files, even beyond maxLevel
 			if !sp.exporter.shouldDirBeIgnored(entry.Name(), subDirPath) {
 				err := sp.traverseDirectoryStreaming(subDirPath, level+1)
@@ -575,7 +639,7 @@ func (sp *streamingProcessor) processBatch() {
 
 	// Immediately clear the batch to free memory
 	sp.currentBatch = sp.currentBatch[:0] // Reset slice but keep capacity
-	runtime.GC() // Suggest garbage collection
+	runtime.GC()                          // Suggest garbage collection
 
 	log.Tracef("Batch processed and memory freed")
 }
@@ -590,7 +654,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 
 	// Calculate level relative to root path
 	relativeLevel := sp.calculateRelativeLevel(aggregationPath)
-	
+
 	// For items beyond maxLevel: still process files for propagation, skip directory metrics
 	beyondMaxLevel := relativeLevel > sp.maxLevel
 	if beyondMaxLevel {
@@ -605,7 +669,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 			return
 		}
 	}
-	
+
 	// Process all items - let the level-based aggregation handle duplicates
 	// Only skip if this would create infinite recursion (which shouldn't happen in streaming)
 
@@ -641,7 +705,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 		// For directories: only add size to immediate level, count the directory
 		stats.totalSize += item.size
 		log.Debugf("Directory size %d added only to level %d: %s", item.size, relativeLevel, item.path)
-		
+
 		// Only increment directory count if flag is enabled
 		if sp.exporter.collectDirCount {
 			stats.directoryCount++
@@ -650,7 +714,7 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 	} else {
 		// For files: add size to immediate level and count the file
 		stats.totalSize += item.size
-		
+
 		// Count file at its immediate level only
 		if sp.exporter.collectFileCount {
 			stats.fileCount++
@@ -660,10 +724,10 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 		if sp.exporter.collectSizeBucket && stats.sizeBuckets != nil {
 			sizeRange := getSizeRange(item.size)
 			stats.sizeBuckets[sizeRange]++
-			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", 
+			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)",
 				relativeLevel, item.path, item.size, sizeRange)
 		}
-		
+
 		// FIX: Propagate file size to all parent directory levels
 		// This ensures level 1 directories include all files from subdirectories
 		sp.propagateFileSizeToParents(aggregationPath, relativeLevel, item.size)
@@ -673,24 +737,24 @@ func (sp *streamingProcessor) aggregateStreamingItem(item streamingItem) {
 // propagateFileSizeToParents propagates file size to all parent directory levels
 func (sp *streamingProcessor) propagateFileSizeToParents(startPath string, startLevel int, fileSize int64) {
 	currentPath := startPath
-	
+
 	// Move up the directory hierarchy and add file size to each parent level
 	for level := startLevel - 1; level >= 0; level-- {
 		currentPath = filepath.Dir(currentPath)
-		
+
 		// Safety check to prevent infinite loops
 		if currentPath == "/" || currentPath == "." {
 			break
 		}
-		
+
 		// Stop if we go beyond the root path
 		rootLevel := sp.calculateRelativeLevel(currentPath)
 		if rootLevel < 0 {
 			break
 		}
-		
+
 		parentKey := fmt.Sprintf("%s:%d", currentPath, rootLevel)
-		
+
 		// Get or create stats for parent level
 		sp.statsMutex.Lock()
 		if sp.stats[parentKey] == nil {
@@ -707,7 +771,7 @@ func (sp *streamingProcessor) propagateFileSizeToParents(startPath string, start
 		}
 		parentStats := sp.stats[parentKey]
 		sp.statsMutex.Unlock()
-		
+
 		// Add file size to parent level
 		parentStats.Lock()
 		parentStats.totalSize += fileSize
@@ -721,26 +785,26 @@ func (sp *streamingProcessor) calculateRelativeLevel(path string) int {
 	// Clean both paths to ensure consistent comparison
 	cleanRootPath := filepath.Clean(sp.rootPath)
 	cleanPath := filepath.Clean(path)
-	
+
 	// If the path is the same as root path, level is 0
 	if cleanPath == cleanRootPath {
 		return 0
 	}
-	
+
 	// Check if path is within root path
 	if !strings.HasPrefix(cleanPath, cleanRootPath+string(filepath.Separator)) {
 		// Path is not within root path, return 0 for safety
 		return 0
 	}
-	
+
 	// Get relative path from root
 	relativePath := strings.TrimPrefix(cleanPath, cleanRootPath+string(filepath.Separator))
-	
+
 	// Count directory separators to determine level
 	if relativePath == "" {
 		return 0
 	}
-	
+
 	level := strings.Count(relativePath, string(filepath.Separator)) + 1
 	return level
 }
@@ -796,60 +860,65 @@ func init() {
 
 // Exporter is the type to be used to start HTTP server and run the analysis
 type Exporter struct {
-	paths          map[string]int
-	ignoreDirPaths map[string]struct{}
-	followSymlinks bool
-	basicAuth      map[string]string
-	storagePath    string
-	scanInterval   time.Duration
-	storage        *analyze.Storage
-	storageCloseFn func()
-	cachedStats    map[string]map[string]*aggregatedStats // path -> level:stats
-	lastScanTime   time.Time
-	mu             sync.RWMutex
-	stopChan       chan struct{}
-	useStorage     bool
-	diskCaching    bool
-	maxProcs       int
-	collectDirCount    bool
-	collectFileCount   bool
-	collectSizeBucket  bool
-	
+	paths             map[string]int
+	ignoreDirPaths    map[string]struct{}
+	followSymlinks    bool
+	basicAuth         map[string]string
+	storagePath       string
+	scanInterval      time.Duration
+	storage           *analyze.Storage
+	storageCloseFn    func()
+	cachedStats       map[string]map[string]*aggregatedStats // path -> level:stats
+	lastScanTime      time.Time
+	mu                sync.RWMutex
+	stopChan          chan struct{}
+	useStorage        bool
+	diskCaching       bool
+	maxProcs          int
+	collectDirCount   bool
+	collectFileCount  bool
+	collectSizeBucket bool
+
 	// Sequential DB write components
-	sharedStorage  *analyze.Storage
-	jsonStorage    JSONStorageInterface
-	storageMutex   sync.Mutex
-	writeQueue     chan writeRequest
-	writerDone     chan struct{}
-	
+	sharedStorage *analyze.Storage
+	storageMutex  sync.Mutex
+	writeQueue    chan writeRequest
+	writerDone    chan struct{}
+
 	// Aggregated statistics storage
 	aggregatedStats map[string]*aggregatedStats
 	statsMutex      sync.RWMutex
 	topNLimit       int
-	
+
+	// SQLite storage for metrics data
+	sqliteStorage storage.Storage
+	dbPath        string
+	batchSize     int
+
 	// Scan state tracking
 	isScanning      bool
 	scanMutex       sync.RWMutex
 	hasValidResults bool
-	
+
 	// Temporary stats during scanning
-	tempStats       map[string]*aggregatedStats
-	tempStatsMutex  sync.RWMutex
+	tempStats      map[string]*aggregatedStats
+	tempStatsMutex sync.RWMutex
 }
 
 // NewExporter creates new Exporter
 func NewExporter(paths map[string]int, followSymlinks bool) *Exporter {
 	return &Exporter{
-		followSymlinks:   followSymlinks,
-		paths:            paths,
-		stopChan:         make(chan struct{}),
-		maxProcs:         4,    // default value
-		writeQueue:       make(chan writeRequest, 100), // Buffer for write requests
-		writerDone:       make(chan struct{}),
-		aggregatedStats:  make(map[string]*aggregatedStats),
-		tempStats:        make(map[string]*aggregatedStats),
-		cachedStats:      make(map[string]map[string]*aggregatedStats),
-		topNLimit:        1000, // Track top 1000 largest files (only if needed)
+		followSymlinks:  followSymlinks,
+		paths:           paths,
+		stopChan:        make(chan struct{}),
+		maxProcs:        4,                            // default value
+		writeQueue:      make(chan writeRequest, 100), // Buffer for write requests
+		writerDone:      make(chan struct{}),
+		aggregatedStats: make(map[string]*aggregatedStats),
+		tempStats:       make(map[string]*aggregatedStats),
+		cachedStats:     make(map[string]map[string]*aggregatedStats),
+		topNLimit:       1000, // Track top 1000 largest files (only if needed)
+		batchSize:       1000, // Default batch size for SQLite operations
 	}
 }
 
@@ -858,13 +927,40 @@ func (e *Exporter) SetStorageConfig(storagePath string, scanIntervalMinutes int,
 	e.storagePath = storagePath
 	e.scanInterval = time.Duration(scanIntervalMinutes) * time.Minute
 	e.useStorage = storagePath != "" && scanIntervalMinutes > 0
-	e.diskCaching = diskCaching
-	
+	e.diskCaching = diskCaching // Kept for backward compatibility, but deprecated
+
 	if diskCaching {
-		log.Infof("Disk caching enabled with BadgerDB + JSON storage at: %s", storagePath)
+		log.Warnf("Disk caching with JSON storage is deprecated. Use SQLite storage instead. Path: %s", storagePath)
 	} else {
-		log.Infof("Disk caching disabled, using memory-only cache")
+		log.Infof("Using memory-only cache for legacy storage. Consider enabling SQLite storage.")
 	}
+}
+
+// SetSQLiteStorage configures SQLite storage for efficient batch operations
+func (e *Exporter) SetSQLiteStorage(dbPath string, batchSize int) error {
+	e.dbPath = dbPath
+	if batchSize > 0 {
+		e.batchSize = batchSize
+	}
+
+	// Initialize SQLite storage with optimized configuration
+	config := storage.DefaultStorageConfig()
+	config.DBPath = dbPath
+	config.BatchSize = e.batchSize
+
+	sqliteStorage, err := storage.NewSQLiteStorage(dbPath, config)
+	if err != nil {
+		return fmt.Errorf("failed to create SQLite storage: %v", err)
+	}
+
+	// Initialize database schema
+	if err := sqliteStorage.Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize SQLite storage: %v", err)
+	}
+
+	e.sqliteStorage = sqliteStorage
+	log.Infof("SQLite storage configured at: %s (batch size: %d)", dbPath, e.batchSize)
+	return nil
 }
 
 // SetMaxProcs sets the maximum number of CPU cores to use
@@ -883,42 +979,91 @@ func (e *Exporter) SetCollectionFlags(dirCount, fileCount, sizeBucket bool) {
 }
 
 
+// initializeSQLiteStorage initializes SQLite storage backend
+func (e *Exporter) initializeSQLiteStorage() error {
+	if e.dbPath == "" {
+		return fmt.Errorf("SQLite database path not configured")
+	}
+
+	// Create storage configuration
+	config := storage.DefaultStorageConfig()
+	config.DBPath = e.dbPath
+	config.BatchSize = e.batchSize
+
+	// Initialize SQLite storage
+	sqliteStorage, err := storage.NewSQLiteStorage(e.dbPath, config)
+	if err != nil {
+		return fmt.Errorf("failed to create SQLite storage: %v", err)
+	}
+
+	// Initialize database schema
+	if err := sqliteStorage.Initialize(); err != nil {
+		sqliteStorage.Close()
+		return fmt.Errorf("failed to initialize SQLite storage: %v", err)
+	}
+
+	e.sqliteStorage = sqliteStorage
+	log.Infof("SQLite storage initialized at: %s", e.dbPath)
+	return nil
+}
+
+// convertAggregatedStatsToDiskStats converts aggregatedStats to storage.DiskStat
+func (e *Exporter) convertAggregatedStatsToDiskStats(statsMap map[string]*aggregatedStats) []storage.DiskStat {
+	var diskStats []storage.DiskStat
+
+	for _, stats := range statsMap {
+		stats.Lock()
+
+		// Create DiskStat with basic fields
+		diskStat := storage.DiskStat{
+			Path:        stats.path,
+			Level:       stats.level,
+			Size:        stats.totalSize,
+			FileCount:   stats.fileCount,
+			DirCount:    stats.directoryCount,
+			SizeBuckets: make(map[string]int64),
+			TopFiles:    make([]storage.TopFileInfo, len(stats.topFiles)),
+			OthersTotal: stats.othersTotal,
+			OthersCount: stats.othersCount,
+		}
+
+		// Copy size buckets if available
+		if stats.sizeBuckets != nil {
+			for sizeRange, count := range stats.sizeBuckets {
+				diskStat.SizeBuckets[sizeRange] = count
+			}
+		}
+
+		// Convert top files if available
+		for i, topFile := range stats.topFiles {
+			diskStat.TopFiles[i] = storage.TopFileInfo{
+				Path: topFile.path,
+				Size: topFile.size,
+				Rank: topFile.rank,
+			}
+		}
+
+		stats.Unlock()
+		diskStats = append(diskStats, diskStat)
+	}
+
+	return diskStats
+}
+
 // initializeSharedStorage initializes shared storage and starts writer goroutine
 func (e *Exporter) initializeSharedStorage() {
 	e.storageMutex.Lock()
 	defer e.storageMutex.Unlock()
-	
-	// Use JSON storage when disk caching is enabled
-	if e.diskCaching && e.storagePath != "" {
-		if e.jsonStorage == nil {
-			e.jsonStorage = NewJSONStorage(e.storagePath)
-			closeFn, err := e.jsonStorage.Open()
-			if err != nil {
-				log.Warnf("Failed to open JSON storage at %s: %v, falling back to memory-only mode", e.storagePath, err)
-				e.jsonStorage = nil
-				e.diskCaching = false
-				return
-			}
-			e.storageCloseFn = closeFn
-			log.Infof("JSON storage initialized successfully at: %s", e.storagePath)
-			
-			// Load existing data from storage
-			e.loadExistingDataFromStorage()
-			
-			// Start writer goroutine
-			go e.runStorageWriter()
-		}
-	} else {
-		// Fallback to original gob-based storage for backward compatibility
-		if e.sharedStorage == nil && e.useStorage {
-			e.sharedStorage = analyze.NewStorage(e.storagePath, "")
-			if e.sharedStorage != nil {
-				closeFn := e.sharedStorage.Open()
-				if closeFn != nil {
-					e.storageCloseFn = closeFn
-					// Start writer goroutine
-					go e.runStorageWriter()
-				}
+
+	// Use original gob-based storage for backward compatibility (deprecated)
+	if e.sharedStorage == nil && e.useStorage {
+		e.sharedStorage = analyze.NewStorage(e.storagePath, "")
+		if e.sharedStorage != nil {
+			closeFn := e.sharedStorage.Open()
+			if closeFn != nil {
+				e.storageCloseFn = closeFn
+				// Start writer goroutine
+				go e.runStorageWriter()
 			}
 		}
 	}
@@ -927,7 +1072,7 @@ func (e *Exporter) initializeSharedStorage() {
 // runStorageWriter runs the sequential DB write goroutine
 func (e *Exporter) runStorageWriter() {
 	defer close(e.writerDone)
-	
+
 	for {
 		select {
 		case req := <-e.writeQueue:
@@ -945,98 +1090,23 @@ func (e *Exporter) runStorageWriter() {
 func (e *Exporter) writeToStorage(path string, result fs.Item) error {
 	e.storageMutex.Lock()
 	defer e.storageMutex.Unlock()
-	
-	// Use JSON storage if disk caching is enabled
-	if e.diskCaching && e.jsonStorage != nil {
-		// Get the dir-level for this path to limit caching depth
-		maxLevel := e.paths[path]
-		if maxLevel < 0 {
-			maxLevel = 0 // Default to level 0 if not found
-		}
-		
-		// Use level-based caching to optimize storage size
-		if jsonStorageWithLevel, ok := e.jsonStorage.(interface {
-			StoreDirWithLevel(string, fs.Item, int) error
-		}); ok {
-			log.Debugf("Storing with level limit %d for path: %s", maxLevel, path)
-			return jsonStorageWithLevel.StoreDirWithLevel(path, result, maxLevel)
-		}
-		
-		// Fallback to regular storage if StoreDirWithLevel is not available
-		return e.jsonStorage.StoreDir(path, result)
-	}
-	
+
+	// JSON storage has been removed - using SQLite instead
+
 	// Fallback to gob storage for backward compatibility
 	if e.sharedStorage != nil {
 		return e.sharedStorage.StoreDir(result)
 	}
-	
+
 	return fmt.Errorf("no storage backend initialized")
 }
 
 // loadExistingDataFromStorage loads cached data from JSON storage on startup
 func (e *Exporter) loadExistingDataFromStorage() {
-	if e.jsonStorage == nil || !e.jsonStorage.IsOpen() {
-		return
-	}
-	
-	// Initialize cached stats map if needed
-	if e.cachedStats == nil {
-		e.cachedStats = make(map[string]map[string]*aggregatedStats)
-	}
-	
-	// Attempt to load data for each configured path
-	loadedCount := 0
-	for path := range e.paths {
-		// Get the dir-level for this path to load only necessary data
-		maxLevel := e.paths[path]
-		if maxLevel < 0 {
-			maxLevel = 0 // Default to level 0 if not found
-		}
-		
-		// Try to load with level filtering if available
-		var item fs.Item
-		var err error
-		if jsonStorageWithLevel, ok := e.jsonStorage.(interface {
-			LoadDirWithLevel(string, int) (fs.Item, error)
-		}); ok {
-			log.Debugf("Loading with level limit %d for path: %s", maxLevel, path)
-			item, err = jsonStorageWithLevel.LoadDirWithLevel(path, maxLevel)
-		} else {
-			// Fallback to regular loading
-			item, err = e.jsonStorage.LoadDir(path)
-		}
-		
-		if err == nil && item != nil {
-			// Convert loaded fs.Item to lightweight aggregated stats
-			e.convertToAggregatedStats(path, item)
-			loadedCount++
-			log.Debugf("Loaded and converted cached data from storage for path: %s", path)
-		} else {
-			log.Debugf("No cached data found in storage for path: %s (this is normal for first run)", path)
-		}
-	}
-	
-	if loadedCount > 0 {
-		log.Infof("Successfully loaded cached data from JSON storage for %d out of %d paths", loadedCount, len(e.paths))
-		// Update last scan time to indicate we have valid data
-		e.lastScanTime = time.Now()
-		e.setValidResults(true)
-	} else {
-		log.Info("No cached data found in JSON storage - will perform fresh scan")
-	}
+	// JSON storage has been removed - using SQLite instead
+	log.Info("JSON storage has been deprecated - using SQLite for data persistence")
 }
 
-// queueStorageWrite queues a write request for sequential processing
-func (e *Exporter) queueStorageWrite(path string, result fs.Item) {
-	select {
-	case e.writeQueue <- writeRequest{path: path, result: result, done: nil}:
-		// Queued successfully
-	default:
-		// Queue is full, log warning
-		log.Warnf("Storage write queue is full, dropping write request for path: %s", path)
-	}
-}
 
 func (e *Exporter) runBackgroundScan() {
 	if e.storagePath == "" || e.scanInterval == 0 {
@@ -1092,43 +1162,43 @@ func (e *Exporter) performAnalysis() {
 			maxLevel: maxLevel,
 		})
 	}
-	
+
 	// Create channels for work distribution
 	workChan := make(chan workUnit, len(workUnits))
 	resultChan := make(chan workResult, len(workUnits))
-	
+
 	// Fill work channel
 	for _, unit := range workUnits {
 		workChan <- unit
 	}
 	close(workChan)
-	
+
 	// Start worker pool with max-procs workers
 	var wg sync.WaitGroup
 	for i := 0; i < e.maxProcs; i++ {
 		wg.Add(1)
 		go e.streamingWorker(i, workChan, resultChan, &wg)
 	}
-	
+
 	// Wait for all workers to complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
-	
+
 	// Process results and store aggregated stats
 	pathResults := make(map[string]struct {
 		stats   map[string]*aggregatedStats
 		elapsed time.Duration
 		err     error
 	})
-	
+
 	for result := range resultChan {
 		if result.err != nil {
 			log.Warnf("Streaming scan failed for path %s: %v", result.rootPath, result.err)
 			continue
 		}
-		
+
 		// Merge stats for the same root path
 		if existing, ok := pathResults[result.rootPath]; ok {
 			// Merge stats maps
@@ -1147,27 +1217,32 @@ func (e *Exporter) performAnalysis() {
 			}
 		}
 	}
-	
+
 	// Store final results
 	for path, result := range pathResults {
-		// Store aggregated stats in cache
+		// Store aggregated stats in cache (for backward compatibility)
 		e.mu.Lock()
 		e.cachedStats[path] = result.stats
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
-		
-		// Queue storage write if disk caching is enabled
-		if e.diskCaching && e.jsonStorage != nil && len(result.stats) > 0 {
-			// Create a dummy fs.Item for storage compatibility
-			// Note: This should be replaced with native aggregatedStats storage
-			log.Debugf("Skipping fs.Item-based storage for streaming results (path: %s)", path)
+
+		// Store to SQLite if configured
+		if e.sqliteStorage != nil && len(result.stats) > 0 {
+			diskStats := e.convertAggregatedStatsToDiskStats(result.stats)
+			if err := e.sqliteStorage.StoreBatch(diskStats); err != nil {
+				log.Errorf("Failed to store scan results to SQLite for path %s: %v", path, err)
+			} else {
+				log.Debugf("Stored %d records to SQLite for path: %s", len(diskStats), path)
+			}
 		}
-		
+
+		// Legacy disk caching has been removed - using SQLite instead
+
 		// Log scan completion time with goroutine stats
-		log.Infof("Scan completed for path: %s, stats: %d, workers: %d", 
+		log.Infof("Scan completed for path: %s, stats: %d, workers: %d",
 			path, len(result.stats), e.maxProcs)
 	}
-	
+
 	// Transfer cached stats to aggregated stats for metric publishing
 	e.statsMutex.Lock()
 	for _, pathStats := range pathResults {
@@ -1176,10 +1251,10 @@ func (e *Exporter) performAnalysis() {
 		}
 	}
 	e.statsMutex.Unlock()
-	
+
 	// Publish aggregated metrics
 	e.publishAggregatedMetrics()
-	
+
 	// Update results validity
 	e.setValidResults(true)
 }
@@ -1187,15 +1262,15 @@ func (e *Exporter) performAnalysis() {
 // streamingWorker processes work units from the work channel using analysis
 func (e *Exporter) streamingWorker(workerID int, workChan <-chan workUnit, resultChan chan<- workResult, wg *sync.WaitGroup) {
 	defer wg.Done()
-	
+
 	log.Debugf("Worker %d started", workerID)
-	
+
 	for unit := range workChan {
-		log.Infof("Worker %d: Starting scan for path: %s (dir-level: %d)", 
+		log.Infof("Worker %d: Starting scan for path: %s (dir-level: %d)",
 			workerID, unit.rootPath, unit.maxLevel)
-		
+
 		startTime := time.Now()
-		
+
 		// Use godirwalk processor
 		processor := newProcessor(e, unit.rootPath, unit.maxLevel)
 		err := processor.processDirectory()
@@ -1203,48 +1278,48 @@ func (e *Exporter) streamingWorker(workerID int, workChan <-chan workUnit, resul
 		if err == nil {
 			stats = processor.getStats()
 		}
-		
+
 		// Send result
 		resultChan <- workResult{
 			rootPath: unit.rootPath,
 			stats:    stats,
 			err:      err,
 		}
-		
+
 		elapsed := time.Since(startTime)
-		log.Infof("Worker %d: Completed scan for path: %s, elapsed: %v, stats: %d", 
+		log.Infof("Worker %d: Completed scan for path: %s, elapsed: %v, stats: %d",
 			workerID, unit.rootPath, elapsed, len(stats))
 	}
-	
+
 	log.Debugf("Worker %d finished", workerID)
 }
 
 func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 	// Use WaitGroup for parallel analysis
 	var wg sync.WaitGroup
-	
+
 	// Channel for results to prevent race conditions
 	resultChan := make(chan struct {
-		path   string
-		result fs.Item
+		path    string
+		result  fs.Item
 		elapsed time.Duration
 	}, len(e.paths))
-	
+
 	// Start parallel analysis for each path
 	for path := range e.paths {
 		wg.Add(1)
 		go func(path string) {
 			defer wg.Done()
-			
+
 			// Track scan time for each path
 			startTime := time.Now()
 			maxLevel := e.paths[path]
 			if maxLevel < 0 {
 				maxLevel = 0
 			}
-			log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)", 
+			log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)",
 				path, maxLevel, runtime.NumGoroutine())
-			
+
 			// Use constGC=true for better memory management during intensive analysis
 			// Handle potential database lock errors during analysis
 			func() {
@@ -1254,18 +1329,18 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 						return
 					}
 				}()
-				
+
 				// Create separate analyzer for each path to avoid conflicts
 				pathAnalyzer := analyze.CreateAnalyzer()
 				pathAnalyzer.SetFollowSymlinks(e.followSymlinks)
-				
+
 				dir := pathAnalyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 				dir.UpdateStats(fs.HardLinkedItems{})
-				
+
 				// Send result to channel
 				resultChan <- struct {
-					path   string
-					result fs.Item
+					path    string
+					result  fs.Item
 					elapsed time.Duration
 				}{
 					path:    path,
@@ -1275,13 +1350,13 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 			}()
 		}(path)
 	}
-	
+
 	// Wait for all analysis to complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
-	
+
 	// Process results and queue for sequential DB writes
 	for result := range resultChan {
 		// Convert and store results in lightweight stats cache
@@ -1294,18 +1369,13 @@ func (e *Exporter) performAnalysisWithStored(stored *analyze.StoredAnalyzer) {
 		e.convertToAggregatedStats(result.path, result.result)
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
-		
-		// Queue storage write if disk caching is enabled
-		// JSON storage avoids the circular reference issues that occurred with gob
-		if e.diskCaching && e.jsonStorage != nil {
-			e.queueStorageWrite(result.path, result.result)
-		}
-		
+
+
 		// MEMORY OPTIMIZATION: Immediately release the full fs.Item result after processing
 		// This prevents holding large directory structures in memory longer than necessary
 		result.result = nil
 		runtime.GC() // Suggest garbage collection to free the large fs.Item structure
-		
+
 		// Log scan completion time with goroutine stats
 		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", result.path, result.elapsed, runtime.NumGoroutine())
 	}
@@ -1319,134 +1389,44 @@ func (e *Exporter) performAnalysisWithRegular(analyzer *analyze.ParallelAnalyzer
 		if maxLevel < 0 {
 			maxLevel = 0
 		}
-		log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)", 
+		log.Infof("Starting background scan for path: %s (dir-level: %d, goroutines: %d)",
 			path, maxLevel, runtime.NumGoroutine())
-		
+
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
-		
+
 		// Convert and store results in lightweight stats cache
 		// MEMORY OPTIMIZATION: Process level-limited aggregated stats immediately
 		e.mu.Lock()
 		e.convertToAggregatedStats(path, dir)
 		e.lastScanTime = time.Now()
 		e.mu.Unlock()
-		
-		// Queue storage write if disk caching is enabled
-		if e.diskCaching && e.jsonStorage != nil {
-			e.queueStorageWrite(path, dir)
-		}
-		
+
+
 		// MEMORY OPTIMIZATION: Release the full fs.Item after processing to free memory
 		// This is especially important when scanning large directory structures
 		dir = nil
 		runtime.GC() // Suggest garbage collection to free the large fs.Item structure
-		
+
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
 		log.Infof("Background scan completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
-		
+
 		// Reset progress for next analysis
 		analyzer.ResetProgress()
 	}
 }
 
-func (e *Exporter) runAnalysis() {
-	defer debug.FreeOSMemory()
 
-	log.Infof("Using %d CPU cores for live analysis (godirwalk, folder-level processing)", e.maxProcs)
 
-	// Set scanning state
-	e.setScanningState(true)
-	defer e.setScanningState(false)
-
-	// Use analysis for live results
-	e.performLiveAnalysis()
-
-	// Mark that we have valid results
-	e.setValidResults(true)
-
-	log.Info("All live analysis completed")
-}
-
-// performLiveAnalysis performs live analysis for immediate results
-func (e *Exporter) performLiveAnalysis() {
-	// Temporary stats for live analysis
-	tempStats := make(map[string]map[string]*aggregatedStats)
-	var tempMutex sync.RWMutex
-
-	// Use WaitGroup for parallel analysis
-	var wg sync.WaitGroup
-	
-	// Start parallel analysis for each path
-	for path := range e.paths {
-		wg.Add(1)
-		go func(path string) {
-			defer wg.Done()
-			
-			// Track scan time for each path
-			startTime := time.Now()
-			maxLevel := e.paths[path]
-			if maxLevel < 0 {
-				maxLevel = 0
-			}
-			log.Debugf("Starting live scan for path: %s (dir-level: %d)", path, maxLevel)
-			
-			// Use godirwalk processor
-			processor := newProcessor(e, path, maxLevel)
-			err := processor.processDirectory()
-			var stats map[string]*aggregatedStats
-			if err == nil {
-				stats = processor.getStats()
-			}
-			
-			if err != nil {
-				log.Warnf("Live scan failed for path %s: %v", path, err)
-				return
-			}
-			tempMutex.Lock()
-			tempStats[path] = stats
-			tempMutex.Unlock()
-			
-			elapsedTime := time.Since(startTime)
-			log.Debugf("Live scan completed for path: %s, elapsed time: %v, stats: %d", 
-				path, elapsedTime, len(stats))
-		}(path)
-	}
-	
-	// Wait for all analysis to complete
-	wg.Wait()
-	
-	// Atomically update aggregated stats for live results
-	e.statsMutex.Lock()
-	e.aggregatedStats = make(map[string]*aggregatedStats)
-	for _, pathStats := range tempStats {
-		for key, stats := range pathStats {
-			e.aggregatedStats[key] = stats
-		}
-	}
-	e.statsMutex.Unlock()
-	
-	// Publish the live results
-	e.publishAggregatedMetrics()
-	
-	log.Debugf("Live analysis results published with %d total stats", len(e.aggregatedStats))
-}
-
-// runAnalysisAsync runs analysis in background without blocking
-func (e *Exporter) runAnalysisAsync() {
-	go func() {
-		e.runAnalysis()
-	}()
-}
 
 // provideEmptyMetrics provides empty metrics when no scan results are available
 func (e *Exporter) provideEmptyMetrics() {
 	for path, level := range e.paths {
 		for i := 0; i <= level; i++ {
 			levelStr := fmt.Sprintf("%d", i)
-			
+
 			// Provide metrics based on collection flags
 			if e.collectDirCount {
 				diskUsageDirectoryCount.WithLabelValues(path, levelStr).Set(0)
@@ -1463,7 +1443,7 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting live analysis for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
-		
+
 		// Use constGC=true for better memory management during intensive analysis
 		// Handle potential database lock errors during analysis
 		func() {
@@ -1482,11 +1462,11 @@ func (e *Exporter) performLiveAnalysisWithStored(stored *analyze.StoredAnalyzer)
 					}
 				}
 			}()
-			
+
 			dir := stored.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 			dir.UpdateStats(fs.HardLinkedItems{})
 			e.analyzeAndAggregate(dir, 0, level, path)
-			
+
 			// Log scan completion time with goroutine stats
 			elapsedTime := time.Since(startTime)
 			log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
@@ -1502,12 +1482,12 @@ func (e *Exporter) performLiveAnalysisWithRegular(analyzer *analyze.ParallelAnal
 		// Track scan time for each path
 		startTime := time.Now()
 		log.Infof("Starting live analysis for path: %s, initial goroutines: %d", path, runtime.NumGoroutine())
-		
+
 		// Use constGC=true for better memory management during intensive analysis
 		dir := analyzer.AnalyzeDir(path, e.shouldDirBeIgnored, true)
 		dir.UpdateStats(fs.HardLinkedItems{})
 		e.analyzeAndAggregate(dir, 0, level, path)
-		
+
 		// Log scan completion time with goroutine stats
 		elapsedTime := time.Since(startTime)
 		log.Infof("Live analysis completed for path: %s, elapsed time: %v, goroutines: %d", path, elapsedTime, runtime.NumGoroutine())
@@ -1535,8 +1515,15 @@ func (e *Exporter) shouldDirBeIgnored(_, path string) bool {
 	return ok
 }
 
-
 func (e *Exporter) loadFromStorage() {
+	// Try SQLite storage first if available
+	if e.sqliteStorage != nil {
+		e.publishMetricsFromSQLite()
+		log.Debug("Successfully loaded metrics from SQLite storage")
+		return
+	}
+
+	// Fallback to memory cache
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -1587,9 +1574,9 @@ func (e *Exporter) analyzeAndAggregate(item fs.Item, level, maxLevel int, rootPa
 	e.tempStatsMutex.Lock()
 	e.tempStats = make(map[string]*aggregatedStats)
 	e.tempStatsMutex.Unlock()
-	
+
 	e.collectAggregatedStats(item, level, maxLevel, rootPath)
-	
+
 	// After collection is complete, atomically replace the main stats
 	e.statsMutex.Lock()
 	e.tempStatsMutex.Lock()
@@ -1597,7 +1584,7 @@ func (e *Exporter) analyzeAndAggregate(item fs.Item, level, maxLevel int, rootPa
 	e.tempStats = make(map[string]*aggregatedStats)
 	e.tempStatsMutex.Unlock()
 	e.statsMutex.Unlock()
-	
+
 	e.publishAggregatedMetrics()
 }
 
@@ -1608,7 +1595,7 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	}
 
 	path := item.GetPath()
-	
+
 	// Log directory scanning start and progress by level
 	if item.IsDir() {
 		files := item.GetFiles()
@@ -1625,15 +1612,15 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 				}
 			}
 		}
-		log.Debugf("[Level %d] Starting scan: %s (subdirs: %d, files: %d, total: %d)", 
+		log.Debugf("[Level %d] Starting scan: %s (subdirs: %d, files: %d, total: %d)",
 			level, path, dirCount, fileCount, len(files))
 	}
-	
+
 	// Skip files if no file-related metrics are needed
 	if !item.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
 		return
 	}
-	
+
 	// Skip directories if no directory-related metrics are needed - NEW OPTIMIZATION
 	if item.IsDir() && !e.collectDirCount && level > 0 {
 		// Still need to recurse for size-bucket collection from files
@@ -1641,31 +1628,31 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			return
 		}
 	}
-	
+
 	// For files, use parent directory path for aggregation
 	aggregationPath := path
 	if !item.IsDir() {
 		// Get parent directory path for file aggregation
 		aggregationPath = filepath.Dir(path)
 	}
-	
+
 	// Check if we should collect statistics for this path/level combination
 	// For root path: only collect at level 0
 	// For non-root paths: collect at all levels
 	shouldCollect := (aggregationPath == rootPath && level == 0) || (aggregationPath != rootPath)
-	
+
 	if !shouldCollect {
 		return // Skip creating stats entirely for root path at level > 0
 	}
-	
+
 	// Initialize aggregated stats for this path/level if it doesn't exist
 	key := fmt.Sprintf("%s:%d", aggregationPath, level)
-	
+
 	e.tempStatsMutex.Lock()
 	if e.tempStats[key] == nil {
 		e.tempStats[key] = &aggregatedStats{
-			path:        aggregationPath,
-			level:       level,
+			path:  aggregationPath,
+			level: level,
 			// Only initialize sizeBuckets if needed
 			sizeBuckets: func() map[string]int64 {
 				if e.collectSizeBucket {
@@ -1674,7 +1661,7 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 				return nil
 			}(),
 			// Don't initialize topFiles if not needed
-			topFiles:    nil, // Optimize: only create when actually needed
+			topFiles: nil, // Optimize: only create when actually needed
 		}
 	}
 	stats := e.tempStats[key]
@@ -1683,13 +1670,13 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	// Update directory-level statistics
 	stats.Lock()
 	itemSize := item.GetUsage()
-	
+
 	// Process the item at its immediate level
 	if item.IsDir() {
 		// For directories: only add size to immediate level, count the directory
 		stats.totalSize += itemSize
 		log.Debugf("Directory size %d added only to level %d: %s", itemSize, level, path)
-		
+
 		// Only increment directory count if flag is enabled
 		if e.collectDirCount {
 			stats.directoryCount++
@@ -1698,12 +1685,12 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	} else {
 		// For files: add size to immediate level and count the file
 		stats.totalSize += itemSize
-		
+
 		// Process file metrics at immediate level based on collection flags
 		if e.collectFileCount {
 			stats.fileCount++
 		}
-		
+
 		// Only process size buckets if enabled and sizeBuckets map exists
 		if e.collectSizeBucket && stats.sizeBuckets != nil {
 			sizeRange := getSizeRange(itemSize)
@@ -1711,9 +1698,9 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			log.Tracef("[Level %d] File processed: %s (size: %d bytes, bucket: %s)", level, path, itemSize, sizeRange)
 		}
 	}
-	
+
 	stats.Unlock()
-	
+
 	// FIX: For files, propagate size to all parent directory levels
 	// This ensures level 1 directories include all files from subdirectories
 	if !item.IsDir() {
@@ -1725,7 +1712,7 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 	if !item.IsDir() || level >= maxLevel {
 		return // Don't process subdirectories if we're at or beyond maxLevel
 	}
-	
+
 	// Recursively process subdirectories only if within level limit
 	func() {
 		defer func() {
@@ -1734,7 +1721,7 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 				return
 			}
 		}()
-		
+
 		// MEMORY OPTIMIZATION: Only call GetFiles() if we actually need to process subdirectories
 		// This prevents loading 100k+ directory entries into memory when level limit is reached
 		files := item.GetFiles()
@@ -1742,33 +1729,33 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 			log.Debugf("[Level %d] No files found for directory: %s", level, path)
 			return
 		}
-		
+
 		log.Debugf("[Level %d] Processing %d entries in directory: %s (maxLevel: %d)", level, len(files), path, maxLevel)
-		
+
 		// OPTIMIZATION: Only process entries if we need the data
 		processedCount := 0
 		for _, entry := range files {
 			if entry == nil {
 				continue
 			}
-			
+
 			// EARLY TERMINATION: Skip directories that would exceed maxLevel
 			if entry.IsDir() && level+1 > maxLevel {
 				log.Tracef("[Level %d] Skipping directory beyond maxLevel: %s", level+1, entry.GetPath())
 				continue
 			}
-			
+
 			// Skip processing if no relevant metrics needed for this entry type
 			if !entry.IsDir() && !e.collectFileCount && !e.collectSizeBucket {
 				continue
 			}
-			
+
 			e.collectAggregatedStats(entry, level+1, maxLevel, rootPath)
 			processedCount++
 		}
-		
+
 		skippedCount := len(files) - processedCount
-		log.Debugf("[Level %d] Completed scan: %s (processed: %d/%d entries, skipped: %d)", 
+		log.Debugf("[Level %d] Completed scan: %s (processed: %d/%d entries, skipped: %d)",
 			level, path, processedCount, len(files), skippedCount)
 	}()
 }
@@ -1776,35 +1763,35 @@ func (e *Exporter) collectAggregatedStats(item fs.Item, level, maxLevel int, roo
 // propagateFileSizeToParents propagates file size to all parent directory levels for collectAggregatedStats
 func (e *Exporter) propagateFileSizeToParents(startPath string, startLevel int, fileSize int64, rootPath string) {
 	currentPath := startPath
-	
+
 	// Move up the directory hierarchy and add file size to each parent level
 	for level := startLevel - 1; level >= 0; level-- {
 		currentPath = filepath.Dir(currentPath)
-		
+
 		// Safety check to prevent infinite loops
 		if currentPath == "/" || currentPath == "." {
 			break
 		}
-		
+
 		// Calculate actual level for this path
 		actualLevel := level
 		if currentPath == rootPath {
 			actualLevel = 0
 		}
-		
+
 		// Skip if we've gone beyond the root path
 		if len(currentPath) < len(rootPath) {
 			break
 		}
-		
+
 		parentKey := fmt.Sprintf("%s:%d", currentPath, actualLevel)
-		
+
 		// Get or create stats for parent level
 		e.tempStatsMutex.Lock()
 		if e.tempStats[parentKey] == nil {
 			e.tempStats[parentKey] = &aggregatedStats{
-				path:        currentPath,
-				level:       actualLevel,
+				path:  currentPath,
+				level: actualLevel,
 				sizeBuckets: func() map[string]int64 {
 					if e.collectSizeBucket {
 						return make(map[string]int64)
@@ -1816,13 +1803,13 @@ func (e *Exporter) propagateFileSizeToParents(startPath string, startLevel int, 
 		}
 		parentStats := e.tempStats[parentKey]
 		e.tempStatsMutex.Unlock()
-		
+
 		// Add file size to parent level
 		parentStats.Lock()
 		parentStats.totalSize += fileSize
 		log.Debugf("Propagated file size %d to parent level %d: %s", fileSize, actualLevel, currentPath)
 		parentStats.Unlock()
-		
+
 		// Stop when we reach the root path
 		if currentPath == rootPath {
 			break
@@ -1836,29 +1823,29 @@ func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
 	if item == nil {
 		return
 	}
-	
+
 	level := e.paths[rootPath]
 	if level < 0 {
 		level = 0
 	}
-	
+
 	// MEMORY OPTIMIZATION: Log level limits for debugging large directory issues
 	log.Debugf("Converting fs.Item to aggregated stats for path: %s (maxLevel: %d)", rootPath, level)
-	
+
 	// Initialize path stats if needed
 	if e.cachedStats[rootPath] == nil {
 		e.cachedStats[rootPath] = make(map[string]*aggregatedStats)
 	}
-	
+
 	// Clear existing stats and regenerate from fs.Item
 	e.tempStatsMutex.Lock()
 	e.tempStats = make(map[string]*aggregatedStats)
 	e.tempStatsMutex.Unlock()
-	
+
 	// EARLY TERMINATION: Collect stats from the fs.Item structure with strict level limits
 	// This prevents processing beyond the configured dir-level, saving memory
 	e.collectAggregatedStats(item, 0, level, rootPath)
-	
+
 	// Copy temp stats to cached stats
 	e.tempStatsMutex.Lock()
 	for key, stats := range e.tempStats {
@@ -1866,7 +1853,7 @@ func (e *Exporter) convertToAggregatedStats(rootPath string, item fs.Item) {
 	}
 	e.tempStats = make(map[string]*aggregatedStats)
 	e.tempStatsMutex.Unlock()
-	
+
 	log.Debugf("Converted fs.Item to lightweight stats for path: %s (stats count: %d)", rootPath, len(e.cachedStats[rootPath]))
 }
 
@@ -1875,7 +1862,7 @@ func (e *Exporter) publishCachedStats(pathStats map[string]*aggregatedStats) {
 	for _, stats := range pathStats {
 		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
-		
+
 		// Check if this stats entry should be published based on path maxLevel
 		shouldPublish := false
 		for rootPath, maxLevel := range e.paths {
@@ -1886,31 +1873,31 @@ func (e *Exporter) publishCachedStats(pathStats map[string]*aggregatedStats) {
 				break
 			}
 		}
-		
+
 		if !shouldPublish {
 			log.Tracef("Skipping cached stats publication for %s:level%d (beyond configured maxLevel)", stats.path, stats.level)
 			stats.Unlock()
 			continue
 		}
-		
+
 		// Always publish total disk usage metric
 		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
-		
+
 		// Publish metrics based on collection flags
 		if e.collectDirCount {
 			diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
 		}
-		
+
 		if e.collectFileCount {
 			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
 		}
-		
+
 		if e.collectSizeBucket && stats.sizeBuckets != nil {
 			for sizeRange, count := range stats.sizeBuckets {
 				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 			}
 		}
-		
+
 		stats.Unlock()
 	}
 }
@@ -1923,16 +1910,61 @@ func (e *Exporter) updateTopFilesLocked(stats *aggregatedStats, path string, siz
 	return
 }
 
-// publishAggregatedMetrics publishes all aggregated metrics to Prometheus
+// publishAggregatedMetrics publishes all aggregated metrics to Prometheus using SQLite storage
 func (e *Exporter) publishAggregatedMetrics() {
+	// Use SQLite storage if available, fallback to in-memory stats
+	if e.sqliteStorage != nil {
+		e.publishMetricsFromSQLite()
+	} else {
+		e.publishMetricsFromMemory()
+	}
+}
+
+// publishMetricsFromSQLite publishes metrics from SQLite storage
+func (e *Exporter) publishMetricsFromSQLite() {
+	// Get all metrics data from SQLite
+	diskStats, err := e.sqliteStorage.GetMetricsData(e.paths)
+	if err != nil {
+		log.Errorf("Failed to retrieve metrics from SQLite: %v", err)
+		return
+	}
+
+	// Publish metrics from SQLite data
+	for _, stat := range diskStats {
+		levelStr := fmt.Sprintf("%d", stat.Level)
+
+		// Always publish total disk usage metric
+		diskUsage.WithLabelValues(stat.Path, levelStr).Set(float64(stat.Size))
+
+		// Publish metrics based on collection flags
+		if e.collectDirCount {
+			diskUsageDirectoryCount.WithLabelValues(stat.Path, levelStr).Set(float64(stat.DirCount))
+		}
+
+		if e.collectFileCount {
+			diskUsageFileCount.WithLabelValues(stat.Path, levelStr).Set(float64(stat.FileCount))
+		}
+
+		if e.collectSizeBucket && stat.SizeBuckets != nil {
+			for sizeRange, count := range stat.SizeBuckets {
+				diskUsageSizeBucket.WithLabelValues(stat.Path, sizeRange, levelStr).Set(float64(count))
+			}
+		}
+	}
+
+	log.Debugf("Published %d metrics from SQLite storage", len(diskStats))
+}
+
+// publishMetricsFromMemory publishes metrics from in-memory aggregated stats (fallback)
+func (e *Exporter) publishMetricsFromMemory() {
 	e.statsMutex.RLock()
 	defer e.statsMutex.RUnlock()
-	
+
 	// Filter stats by configured maxLevel for each path
 	for _, stats := range e.aggregatedStats {
 		stats.Lock()
 		levelStr := fmt.Sprintf("%d", stats.level)
-		
+
 		// Check if this stats entry should be published based on path maxLevel
 		shouldPublish := false
 		for rootPath, maxLevel := range e.paths {
@@ -1943,38 +1975,38 @@ func (e *Exporter) publishAggregatedMetrics() {
 				break
 			}
 		}
-		
+
 		if !shouldPublish {
 			log.Tracef("Skipping stats publication for %s:level%d (beyond configured maxLevel)", stats.path, stats.level)
 			stats.Unlock()
 			continue
 		}
-		
+
 		// Always publish total disk usage metric
 		diskUsage.WithLabelValues(stats.path, levelStr).Set(float64(stats.totalSize))
-		
+
 		// Publish metrics based on collection flags
 		if e.collectDirCount {
 			diskUsageDirectoryCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.directoryCount))
 		}
-		
+
 		if e.collectFileCount {
 			diskUsageFileCount.WithLabelValues(stats.path, levelStr).Set(float64(stats.fileCount))
 		}
-		
+
 		if e.collectSizeBucket && stats.sizeBuckets != nil {
 			for sizeRange, count := range stats.sizeBuckets {
 				diskUsageSizeBucket.WithLabelValues(stats.path, sizeRange, levelStr).Set(float64(count))
 			}
 		}
-		
+
 		stats.Unlock()
 	}
 }
 
 // WriteToTextfile writes the prometheus report to file
 func (e *Exporter) WriteToTextfile(name string) {
-	e.runAnalysis()
+	e.performScan()
 
 	// Use a custom registry to drop go stats
 	registry := prometheus.NewRegistry()
@@ -2001,8 +2033,9 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	} else {
 		// Live analysis mode - check if scan is needed
 		if e.hasValidScanResults() {
-			// We have previous results, use them
+			// We have previous results, use SQLite or fallback to memory
 			log.Debugf("Using cached analysis results")
+			e.publishAggregatedMetrics()
 		} else if e.isCurrentlyScanning() {
 			// Scan is in progress, provide empty metrics
 			log.Debugf("Scan in progress, providing empty metrics")
@@ -2010,11 +2043,11 @@ func (e *Exporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		} else {
 			// No scan in progress and no results, start async scan and provide empty metrics
 			log.Debugf("Starting background scan, providing empty metrics")
-			e.runAnalysisAsync()
+			go e.performScan()
 			e.provideEmptyMetrics()
 		}
 	}
-	
+
 	promhttp.Handler().ServeHTTP(w, req)
 }
 
@@ -2036,8 +2069,10 @@ func (e *Exporter) authorizeReq(w http.ResponseWriter, req *http.Request) bool {
 
 // StartBackgroundScan starts the background scanning goroutine
 func (e *Exporter) StartBackgroundScan() {
+	// SQLite storage initialization should be done via SetSQLiteStorage() before calling this method
+
 	if e.storagePath != "" && e.scanInterval > 0 {
-		// Initialize storage before starting background scan
+		// Initialize legacy storage before starting background scan
 		e.initializeSharedStorage()
 		go e.runBackgroundScan()
 		log.Printf("Background scan started with interval: %v", e.scanInterval)
@@ -2047,32 +2082,36 @@ func (e *Exporter) StartBackgroundScan() {
 // Stop stops the background scanning
 func (e *Exporter) Stop() {
 	close(e.stopChan)
-	
+
 	// Wait for writer goroutine to finish if it was started
 	if (e.useStorage || e.diskCaching) && e.writerDone != nil {
 		<-e.writerDone
 	}
-	
+
 	// Close the write queue to prevent new writes
 	if e.writeQueue != nil {
 		close(e.writeQueue)
 	}
-	
+
 	if e.storageCloseFn != nil {
 		e.storageCloseFn()
 	}
-	
+
 	// Clean up cached stats
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cachedStats = nil
 	e.storage = nil
 	e.sharedStorage = nil
-	
-	// Clean up JSON storage
-	if e.jsonStorage != nil {
-		e.jsonStorage.Close()
-		e.jsonStorage = nil
+
+	// JSON storage has been removed - using SQLite instead
+
+	// Clean up SQLite storage
+	if e.sqliteStorage != nil {
+		if err := e.sqliteStorage.Close(); err != nil {
+			log.Errorf("Failed to close SQLite storage: %v", err)
+		}
+		e.sqliteStorage = nil
 	}
 }
 

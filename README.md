@@ -8,22 +8,24 @@
 
 Provides detailed info about disk usage of the selected filesystem path with **memory-efficient aggregated metrics** designed for large filesystems.
 
-Uses [gdu](https://github.com/dundee/gdu) under the hood for the disk usage analysis.
+**최신 최적화**: SQLite 기반 영구 저장소와 godirwalk 라이브러리를 활용한 고성능 디렉토리 스캔으로 메모리 사용량을 대폭 개선했습니다.
 
-## 🚀 Key Features
+## 🚀 주요 기능
 
-- **Memory Efficient**: Aggregated metrics reduce memory usage by 99% for large filesystems (1M+ files)
-- **Hierarchical Statistics**: Directory-level, type-based, and size-bucket aggregations
-- **Top-N File Tracking**: Monitors largest files while maintaining low memory footprint
-- **Background Caching**: Optional caching for consistent performance
-- **Multi-Path Support**: Monitor multiple directories with different depth levels
-- **Configurable CPU Usage**: Tune parallelism for optimal performance
+- **메모리 효율성**: 대용량 파일시스템(1M+ 파일)에서 99% 메모리 사용량 감소
+- **SQLite 기반 저장**: 영구 데이터 저장과 고성능 배치 처리
+- **Godirwalk 최적화**: 고성능 디렉토리 순회 라이브러리 활용
+- **Worker Pool 아키텍처**: max-procs 설정으로 CPU 사용량 제어
+- **계층적 통계**: 디렉토리 레벨, 타입별, 크기별 집계
+- **백그라운드 캐싱**: 일관된 성능을 위한 선택적 캐싱
+- **다중 경로 지원**: 서로 다른 깊이 레벨의 여러 디렉토리 모니터링
+- **설정 가능한 CPU 사용량**: 최적 성능을 위한 병렬 처리 조정
 
 ## Demo Grafana dashboard
 
 https://grafana.milde.cz/d/0TfJhs_Mz/disk-usage (credentials: grafana / gdu)
 
-## Usage
+## 사용법
 
 ```
 Usage:
@@ -51,43 +53,45 @@ Flags:
   -v, --version                           Print version information and exit
 ```
 
-### Quick Start Examples
+### 빠른 시작 예제
 
 ```bash
-# Basic usage with single path
+# 단일 경로 기본 사용법
 disk_usage_exporter --analyzed-path /home --dir-level 2
 
-# Multiple paths with different levels
+# 여러 경로를 서로 다른 레벨로 설정
 disk_usage_exporter --multi-paths=/home=2,/var=3
 
-# Using configuration file
-disk_usage_exporter --config config-basic.yml
+# SQLite 데이터베이스를 사용한 고성능 설정
+disk_usage_exporter --analyzed-path /home --db-path /tmp/disk-usage.db --batch-size 1000
 
-# Background caching for better performance
+# 설정 파일 사용
+disk_usage_exporter --config config-sqlite.yml
+
+# 백그라운드 캐싱으로 성능 향상
 disk_usage_exporter --storage-path /tmp/cache --scan-interval-minutes 30
 
-# File output mode
+# 파일 출력 모드
 disk_usage_exporter --mode file --output-file metrics.prom
 
-# Debug mode with detailed logging
+# 디버그 모드로 상세 로그 확인
 disk_usage_exporter --log-level debug --analyzed-path /tmp
 
-# Use 8 CPU cores for better performance
+# 8개 CPU 코어를 사용하여 성능 향상
 disk_usage_exporter --max-procs 8 --analyzed-path /home
 
-# Selective metric collection (collect only directory counts and size buckets)
+# 선택적 메트릭 수집 (디렉토리 수와 크기 버킷만 수집)
 disk_usage_exporter --dir-count --no-file-count --size-bucket --analyzed-path /home
 
-# Environment variable configuration
-LOG_LEVEL=debug disk_usage_exporter --config config-basic.yml
+# 환경변수 설정
+LOG_LEVEL=debug disk_usage_exporter --config config-sqlite.yml
 ```
 
-Either one path can be specified using `--analyzed-path` and `--dir-level` flags or multiple can be set
-using `--multi-paths` flag.
+`--analyzed-path`와 `--dir-level` 플래그를 사용하여 단일 경로를 지정하거나 `--multi-paths` 플래그를 사용하여 여러 경로를 설정할 수 있습니다.
 
-## Version Information
+## 버전 정보
 
-You can check the version information using:
+다음 명령을 사용하여 버전 정보를 확인할 수 있습니다:
 
 ```bash
 # CLI version check
@@ -99,26 +103,26 @@ disk_usage_exporter version
 curl http://localhost:9995/version
 ```
 
-## Available Endpoints
+## 사용 가능한 엔드포인트
 
-When running in HTTP mode, the following endpoints are available:
+HTTP 모드로 실행할 때 다음 엔드포인트를 사용할 수 있습니다:
 
-| Endpoint | Description | Response Format |
+| 엔드포인트 | 설명 | 응답 형식 |
 |----------|-------------|----------------|
-| **/** | Index page with links to all available endpoints | HTML |
-| **/metrics** | Prometheus metrics (main endpoint) | Text/Plain |
-| **/version** | Version information | JSON |
-| **/health** | Health check endpoint | JSON |
+| **/** | 모든 사용 가능한 엔드포인트 링크가 있는 인덱스 페이지 | HTML |
+| **/metrics** | Prometheus 메트릭 (메인 엔드포인트) | Text/Plain |
+| **/version** | 버전 정보 | JSON |
+| **/health** | 헬스 체크 엔드포인트 | JSON |
 
-### Health Check Endpoint
+### 헬스 체크 엔드포인트
 
-The `/health` endpoint provides a simple health check for monitoring systems:
+`/health` 엔드포인트는 모니터링 시스템을 위한 간단한 헬스 체크를 제공합니다:
 
 ```bash
 curl http://localhost:9995/health
 ```
 
-Response:
+응답:
 ```json
 {
   "status": "ok",
@@ -126,15 +130,15 @@ Response:
 }
 ```
 
-### Version Endpoint
+### 버전 엔드포인트
 
-The `/version` endpoint provides detailed version information:
+`/version` 엔드포인트는 상세한 버전 정보를 제공합니다:
 
 ```bash
 curl http://localhost:9995/version
 ```
 
-Response:
+응답:
 ```json
 {
   "buildDate": "Wed Jul 16 17:26:24 KST 2025",
@@ -146,21 +150,21 @@ Response:
 }
 ```
 
-## 📊 Metrics Output
+## 📊 메트릭 출력
 
-The exporter provides **memory-efficient aggregated metrics** instead of individual file metrics, dramatically reducing memory usage for large filesystems.
+이 익스포터는 개별 파일 메트릭 대신 **메모리 효율적인 집계 메트릭**을 제공하여 대용량 파일시스템에서 메모리 사용량을 극적으로 줄입니다.
 
-### Aggregated Metrics Structure
+### 집계 메트릭 구조
 
 ```prometheus
-# Total disk usage by directory
+# 디렉토리별 총 디스크 사용량
 # HELP node_disk_usage Total disk usage by directory
 # TYPE node_disk_usage gauge
 node_disk_usage{level="0",path="/home"} 8.7081373696e+10
 node_disk_usage{level="1",path="/home/user1"} 2.5e+10
 node_disk_usage{level="1",path="/home/user2"} 1.2e+10
 
-# File and directory counts
+# 파일 및 디렉토리 수
 # HELP node_disk_usage_file_count Number of files in directory
 # TYPE node_disk_usage_file_count gauge
 node_disk_usage_file_count{level="1",path="/home/user1"} 50000
@@ -171,9 +175,9 @@ node_disk_usage_file_count{level="1",path="/home/user2"} 25000
 node_disk_usage_directory_count{level="1",path="/home/user1"} 150
 node_disk_usage_directory_count{level="1",path="/home/user2"} 75
 
-# This metric has been removed and replaced with node_disk_usage
+# 이 메트릭은 제거되었고 node_disk_usage로 대체되었습니다
 
-# Size-bucket distributions
+# 크기별 버킷 분포
 # HELP node_disk_usage_size_bucket File count by size range
 # TYPE node_disk_usage_size_bucket gauge
 node_disk_usage_size_bucket{level="1",path="/home/user1",size_range="0-1KB"} 15000
@@ -181,14 +185,14 @@ node_disk_usage_size_bucket{level="1",path="/home/user1",size_range="1KB-1MB"} 3
 node_disk_usage_size_bucket{level="1",path="/home/user1",size_range="1MB-100MB"} 4500
 node_disk_usage_size_bucket{level="1",path="/home/user1",size_range="100MB+"} 500
 
-# Top-N largest files (configurable, default: top 1000)
+# 상위 N개 최대 파일 (설정 가능, 기본값: 상위 1000개)
 # HELP node_disk_usage_top_files Top N largest files
 # TYPE node_disk_usage_top_files gauge
 node_disk_usage_top_files{path="/home/user1/large_file1.dat",rank="1"} 5.0e+09
 node_disk_usage_top_files{path="/home/user1/large_file2.zip",rank="2"} 3.5e+09
 node_disk_usage_top_files{path="/home/user1/backup.tar.gz",rank="3"} 2.8e+09
 
-# Aggregated statistics for files not in top-N
+# 상위 N에 포함되지 않은 파일의 집계 통계
 # HELP node_disk_usage_others_total Total size of files not in top N
 # TYPE node_disk_usage_others_total gauge
 node_disk_usage_others_total{path="/home/user1"} 1.5e+10
@@ -198,50 +202,50 @@ node_disk_usage_others_total{path="/home/user1"} 1.5e+10
 node_disk_usage_others_count{path="/home/user1"} 49000
 ```
 
-### Memory Efficiency Benefits
+### 메모리 효율성 이점
 
-| Filesystem Size | Individual File Metrics | Aggregated Metrics | Memory Savings |
+| 파일시스템 크기 | 개별 파일 메트릭 | 집계 메트릭 | 메모리 절약 |
 |----------------|------------------------|-------------------|----------------|
-| **10K files** | 10,000 metrics | ~100 metrics | **99%** |
-| **100K files** | 100,000 metrics | ~500 metrics | **99.5%** |
-| **1M+ files** | 1,000,000+ metrics | ~2,000 metrics | **99.8%** |
+| **10K 파일** | 10,000 메트릭 | ~100 메트릭 | **99%** |
+| **100K 파일** | 100,000 메트릭 | ~500 메트릭 | **99.5%** |
+| **1M+ 파일** | 1,000,000+ 메트릭 | ~2,000 메트릭 | **99.8%** |
 
-### Size Range Buckets
+### 크기 범위 버킷
 
-Files are automatically categorized into size ranges:
-- **0B**: Empty files
-- **0-1KB**: Small files (config files, small scripts)
-- **1KB-1MB**: Medium files (documents, code files)
-- **1MB-100MB**: Large files (images, small databases)
-- **100MB+**: Very large files (videos, large databases, archives)
+파일은 자동으로 크기 범위로 분류됩니다:
+- **0B**: 빈 파일
+- **0-1KB**: 소형 파일 (설정 파일, 소형 스크립트)
+- **1KB-1MB**: 중형 파일 (문서, 코드 파일)
+- **1MB-100MB**: 대형 파일 (이미지, 소형 데이터베이스)
+- **100MB+**: 초대형 파일 (비디오, 대형 데이터베이스, 아카이브)
 
-## 📈 Example Prometheus Queries
+## 📈 Prometheus 쿼리 예제
 
-### Directory Usage Queries
+### 디렉토리 사용량 쿼리
 
-Total disk usage of `/home` directory and all subdirectories:
+`/home` 디렉토리와 모든 하위 디렉토리의 총 디스크 사용량:
 ```promql
 sum(node_disk_usage{path=~"/home.*"})
 ```
 
-Total number of files in `/var` directory tree:
+`/var` 디렉토리 트리의 총 파일 수:
 ```promql
 sum(node_disk_usage_file_count{path=~"/var.*"})
 ```
 
-Average directory size across all level-1 directories:
+모든 레벨-1 디렉토리의 평균 디렉토리 크기:
 ```promql
 avg(node_disk_usage{level="1"})
 ```
 
-### File Distribution Analysis
+### 파일 분포 분석
 
-Distribution of files by size in `/home/user1`:
+`/home/user1`의 크기별 파일 분포:
 ```promql
 node_disk_usage_size_bucket{path="/home/user1"}
 ```
 
-Percentage of large files (>100MB) in a directory:
+디렉토리에서 대형 파일(>100MB)의 비율:
 ```promql
 (
   node_disk_usage_size_bucket{path="/home/user1",size_range="100MB+"}
@@ -250,72 +254,72 @@ Percentage of large files (>100MB) in a directory:
 ) * 100
 ```
 
-### Top File Analysis
+### 상위 파일 분석
 
-Show top 10 largest files across all paths:
+모든 경로에서 가장 큰 10개 파일 표시:
 ```promql
 topk(10, node_disk_usage_top_files)
 ```
 
-Total space used by top-N files vs others:
+상위 N개 파일과 기타 파일이 사용하는 총 공간:
 ```promql
 sum(node_disk_usage_top_files) / (sum(node_disk_usage_top_files) + sum(node_disk_usage_others_total))
 ```
 
-### Directory Usage Analysis
+### 디렉토리 사용량 분석
 
-Total disk usage across all monitored paths:
+모니터링되는 모든 경로의 총 디스크 사용량:
 ```promql
 sum(node_disk_usage)
 ```
 
-Disk usage growth rate over time:
+시간에 따른 디스크 사용량 증가율:
 ```promql
 rate(node_disk_usage[5m])
 ```
 
-### Growth and Alert Queries
+### 증가량 및 알림 쿼리
 
-Directories with more than 100K files (potential performance issue):
+100K개 이상의 파일을 가진 디렉토리 (성능 문제 가능):
 ```promql
 node_disk_usage_file_count > 100000
 ```
 
-Very large directories (>1TB) that might need cleanup:
+정리가 필요할 수 있는 매우 큰 디렉토리 (>1TB):
 ```promql
 node_disk_usage > 1e12
 ```
 
-Directories with unusually high file density:
+비정상적으로 높은 파일 밀도를 가진 디렉토리:
 ```promql
 (node_disk_usage_file_count / node_disk_usage_directory_count) > 1000
 ```
 
-## Example config files
+## 예시 설정 파일
 
-Several example configuration files are provided in the repository:
+리포지토리에서 여러 예시 설정 파일을 제공합니다:
 
-### Basic Configuration (config-basic.yml)
+### 기본 설정 (config-basic.yml)
 ```yaml
-# Basic configuration without caching
+# 캐싱 없는 기본 설정
 analyzed-path: "/tmp"
 bind-address: "0.0.0.0:9995"
 dir-level: 1
 mode: "http"
 follow-symlinks: false
 
-# Log level configuration
-# Available levels: trace, debug, info, warn, error, fatal, panic
+# 로그 레벨 설정
+# 사용 가능한 레벨: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# CPU 코어 설정
+# 병렬 처리에 사용할 최대 CPU 코어 수
 max-procs: 4
 
-# Selective metric collection configuration
-dir-count: true     # Collect directory count metrics
-file-count: true    # Collect file count metrics
-size-bucket: true   # Collect size bucket metrics
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
 
 ignore-dirs:
   - /proc
@@ -325,29 +329,29 @@ ignore-dirs:
   - /var/cache/rsnapshot
 ```
 
-### Configuration with Background Caching (config-caching.yml)
+### 백그라운드 캐싱 설정 (config-caching.yml)
 ```yaml
-# Configuration with background caching for better performance
+# 성능 향상을 위한 백그라운드 캐싱 설정
 analyzed-path: "/home"
 bind-address: "0.0.0.0:9995"
 dir-level: 2
 mode: "http"
 follow-symlinks: false
 
-# Log level configuration
-# Available levels: trace, debug, info, warn, error, fatal, panic
+# 로그 레벨 설정
+# 사용 가능한 레벨: trace, debug, info, warn, error, fatal, panic
 log-level: "info"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# CPU 코어 설정
+# 병렬 처리에 사용할 최대 CPU 코어 수
 max-procs: 8
 
-# Selective metric collection configuration
-dir-count: true     # Collect directory count metrics
-file-count: true    # Collect file count metrics
-size-bucket: true   # Collect size bucket metrics
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
 
-# Background caching configuration
+# 백그라운드 캐싱 설정
 storage-path: "/tmp/disk-usage-cache"
 scan-interval-minutes: 15
 
@@ -360,25 +364,56 @@ ignore-dirs:
   - /tmp
 ```
 
-### Multiple Paths Configuration (config-multipaths.yml)
+### SQLite 기반 고성능 설정 (config-sqlite.yml)
 ```yaml
-# Monitor multiple directories with different depth levels
+# SQLite 기반 디스크 사용량 Prometheus 익스포터 설정
+# 이 설정은 향상된 성능과 데이터 지속성을 위해 SQLite 데이터베이스를 사용합니다
+analyzed-path: "/home"
+bind-address: "0.0.0.0:9995"
+dir-level: 2
+mode: "http"
+follow-symlinks: false
+
+# 로그 레벨 설정
+log-level: "info"
+
+# 병렬 처리를 위한 최대 CPU 코어 수
+max-procs: 8
+
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
+
+# SQLite 데이터베이스 설정
+db-path: "/tmp/disk-usage.db"
+batch-size: 1000
+
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
+```
+
+### 다중 경로 설정 (config-multipaths.yml)
+```yaml
+# 서로 다른 깊이 레벨의 여러 디렉토리 모니터링
 bind-address: "0.0.0.0:9995"
 mode: "http"
 follow-symlinks: false
 
-# Log level configuration
-# Available levels: trace, debug, info, warn, error, fatal, panic
+# 로그 레벨 설정
 log-level: "info"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# CPU 코어 설정
 max-procs: 6
 
-# Selective metric collection configuration
-dir-count: true     # Collect directory count metrics
-file-count: true    # Collect file count metrics
-size-bucket: true   # Collect size bucket metrics
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
 
 multi-paths:
   /home: 2
@@ -386,7 +421,7 @@ multi-paths:
   /tmp: 1
   /opt: 2
 
-# Background caching configuration
+# 백그라운드 캐싱 설정
 storage-path: "/tmp/disk-usage-cache"
 scan-interval-minutes: 20
 
@@ -397,31 +432,29 @@ ignore-dirs:
   - /run
   - /var/cache/rsnapshot
 
-# Basic authentication (optional)
+# 기본 인증 (선택사항)
 # basic-auth-users:
 #   admin: $2b$12$hNf2lSsxfm0.i4a.1kVpSOVyBCfIB51VRjgBUyv6kdnyTlgWj81Ay
 ```
 
-### File Output Mode Configuration
+### 파일 출력 모드 설정
 ```yaml
-# Output metrics to file instead of HTTP server
+# HTTP 서버 대신 파일로 메트릭 출력
 analyzed-path: /
 mode: file
 output-file: ./disk-usage-exporter.prom
 dir-level: 2
 
-# Log level configuration
-# Available levels: trace, debug, info, warn, error, fatal, panic
+# 로그 레벨 설정
 log-level: "info"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# CPU 코어 설정
 max-procs: 4
 
-# Selective metric collection configuration
-dir-count: true     # Collect directory count metrics
-file-count: true    # Collect file count metrics
-size-bucket: true   # Collect size bucket metrics
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
 
 ignore-dirs:
 - /proc
@@ -430,29 +463,27 @@ ignore-dirs:
 - /run
 ```
 
-### Debug Configuration (config-debug.yml)
+### 디버그 설정 (config-debug.yml)
 ```yaml
-# Debug configuration for troubleshooting
+# 문제 해결을 위한 디버그 설정
 analyzed-path: "/tmp"
 bind-address: "0.0.0.0:9995"
 dir-level: 1
 mode: "http"
 follow-symlinks: false
 
-# Log level configuration - Debug mode for troubleshooting
-# Available levels: trace, debug, info, warn, error, fatal, panic
+# 로그 레벨 설정 - 문제 해결을 위한 디버그 모드
 log-level: "debug"
 
-# CPU cores configuration
-# Maximum number of CPU cores to use for parallel processing
+# CPU 코어 설정
 max-procs: 2
 
-# Selective metric collection configuration
-dir-count: true     # Collect directory count metrics
-file-count: true    # Collect file count metrics
-size-bucket: true   # Collect size bucket metrics
+# 선택적 메트릭 수집 설정
+dir-count: true     # 디렉토리 수 메트릭 수집
+file-count: true    # 파일 수 메트릭 수집
+size-bucket: true   # 크기 버킷 메트릭 수집
 
-# Background caching configuration
+# 백그라운드 캐싱 설정
 storage-path: "/tmp/debug-cache"
 scan-interval-minutes: 5
 
@@ -464,31 +495,34 @@ ignore-dirs:
   - /var/cache/rsnapshot
 ```
 
-### Usage with Config Files
+### 설정 파일 사용법
 ```bash
-# Use specific config file
+# 특정 설정 파일 사용
 ./disk_usage_exporter --config config-basic.yml
 
-# Use config with background caching
+# SQLite 기반 고성능 설정 사용
+./disk_usage_exporter --config config-sqlite.yml
+
+# 백그라운드 캐싱 설정 사용
 ./disk_usage_exporter --config config-caching.yml
 
-# Use config with multiple paths
+# 다중 경로 설정 사용
 ./disk_usage_exporter --config config-multipaths.yml
 
-# Use debug configuration for troubleshooting
+# 문제 해결을 위한 디버그 설정 사용
 ./disk_usage_exporter --config config-debug.yml
 
-# Override config file settings with CLI flags
+# CLI 플래그로 설정 파일 설정 재정의
 ./disk_usage_exporter --config config-basic.yml --log-level debug
 
-# Use custom CPU core count for performance tuning
+# 성능 트닝을 위한 사용자 정의 CPU 코어 수 사용
 ./disk_usage_exporter --config config-basic.yml --max-procs 8
 ```
 
-## Prometheus scrape config
+## Prometheus 스크래이핑 설정
 
-Disk usage analysis can be resource heavy.
-Set the `scrape_interval` and `scrape_timeout` according to the size of analyzed path.
+디스크 사용량 분석은 리소스를 많이 사용할 수 있습니다.
+분석 경로의 크기에 따라 `scrape_interval`과 `scrape_timeout`을 설정하세요.
 
 ```yaml
 scrape_configs:
@@ -499,7 +533,7 @@ scrape_configs:
     - targets: ['localhost:9995']
 ```
 
-**With background caching enabled**, you can use shorter scrape intervals since `/metrics` responses are served from cache:
+**백그라운드 캐싱이 활성화된 경우**, `/metrics` 응답이 캐시에서 제공되므로 더 짧은 스크래이핑 간격을 사용할 수 있습니다:
 
 ```yaml
 scrape_configs:
@@ -510,14 +544,14 @@ scrape_configs:
     - targets: ['localhost:9995']
 ```
 
-## Dump to file
+## 파일로 덤프
 
-The official `node-exporter` allows to specify a folder which contains additional metric files through a [textfile collection mechanism](https://github.com/prometheus/node_exporter#textfile-collector).
-In order to make use of this, one has to set up `node-exporter` according to the documentation and set the `output-file`
-of this exporter to any name ending in `.prom` within said folder (and of course also `mode` to `file`).
+공식 `node-exporter`는 [textfile collection mechanism](https://github.com/prometheus/node_exporter#textfile-collector)을 통해 추가 메트릭 파일이 포함된 폴더를 지정할 수 있습니다.
+이를 활용하려면 문서에 따라 `node-exporter`를 설정하고 이 익스포터의 `output-file`을
+해당 폴더 내에서 `.prom`으로 끝나는 이름으로 설정해야 합니다(물론 `mode`도 `file`로 설정).
 
-A common use case for this is when the calculation of metrics takes particularly long and therefore can only be done
-once in a while. To automate the periodic update of the output file, simply set up a cronjob.
+메트릭 계산이 특히 오래 걸리기 때문에 가끔씩만 수행할 수 있는 경우에 일반적으로 사용됩니다.
+출력 파일의 주기적 업데이트를 자동화하려면 cronjob을 설정하면 됩니다.
 
 ## Basic Auth
 
