@@ -28,18 +28,18 @@ type CustomFormatter struct{}
 func (f *CustomFormatter) Format(entry *log.Entry) ([]byte, error) {
 	// Format timestamp
 	timestamp := entry.Time.Format("2006-01-02 15:04:05")
-	
+
 	// Format log level (uppercase, 4 characters)
 	level := strings.ToUpper(entry.Level.String())
 	if len(level) > 4 {
 		level = level[:4]
 	}
-	
+
 	// Extract caller information
 	filename := "unknown"
 	functionName := "unknown"
 	line := 0
-	
+
 	if entry.HasCaller() {
 		filename = filepath.Base(entry.Caller.File)
 		// Extract function name (remove package path)
@@ -50,11 +50,11 @@ func (f *CustomFormatter) Format(entry *log.Entry) ([]byte, error) {
 		}
 		line = entry.Caller.Line
 	}
-	
+
 	// Format: [timestamp][LEVEL][filename:function:line] message
 	msg := fmt.Sprintf("[%s][%s][%s:%s:%d] %s\n",
 		timestamp, level, filename, functionName, line, entry.Message)
-	
+
 	return []byte(msg), nil
 }
 
@@ -77,7 +77,7 @@ and reporting which directories consume what space.`,
 			printVersion()
 			return
 		}
-		
+
 		// Set log level from configuration
 		logLevel := viper.GetString("log-level")
 		if level, err := log.ParseLevel(logLevel); err == nil {
@@ -86,10 +86,10 @@ and reporting which directories consume what space.`,
 			log.Warnf("Invalid log level '%s', using default 'info'", logLevel)
 			log.SetLevel(log.InfoLevel)
 		}
-		
+
 		// Set custom log formatter with requested format
 		log.SetFormatter(&CustomFormatter{})
-		
+
 		// Enable caller reporting to show file, function, and line info
 		log.SetReportCaller(true)
 
@@ -115,11 +115,27 @@ and reporting which directories consume what space.`,
 			e.SetBasicAuth(viper.GetStringMapString("basic-auth-users"))
 		}
 
-		// Configure storage and scan interval if specified
-		if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
-			e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"), viper.GetBool("disk-caching"))
+		// Configure SQLite storage if db-path is provided
+		dbPath := viper.GetString("db-path")
+		if dbPath != "" {
+			// User explicitly set db-path, configure SQLite
+			batchSize := viper.GetInt("batch-size")
+			if batchSize <= 0 {
+				batchSize = 1000 // default
+			}
+			if err := e.SetSQLiteStorage(dbPath, batchSize); err != nil {
+				log.Fatalf("Failed to configure SQLite storage: %v", err)
+			}
+			log.Infof("SQLite storage configured: database=%s, batch_size=%d", dbPath, batchSize)
+		} else {
+			// No SQLite configured, check for legacy storage
+			if viper.GetString("storage-path") != "" && viper.GetInt("scan-interval-minutes") > 0 {
+				e.SetStorageConfig(viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"), viper.GetBool("disk-caching"))
+				log.Infof("Legacy storage configured: path=%s, interval=%d minutes, disk_caching=%t",
+					viper.GetString("storage-path"), viper.GetInt("scan-interval-minutes"), viper.GetBool("disk-caching"))
+			}
 		}
-		
+
 		// Configure max processors
 		e.SetMaxProcs(viper.GetInt("max-procs"))
 
@@ -163,7 +179,9 @@ func init() {
 	flags.StringToString("basic-auth-users", map[string]string{}, "Basic Auth users and their passwords as bcypt hashes")
 	flags.StringP("storage-path", "s", "", "Path to store cached analysis data")
 	flags.IntP("scan-interval-minutes", "t", 0, "Scan interval in minutes for background caching (0 = disabled)")
-	flags.Bool("disk-caching", false, "Enable disk caching with BadgerDB + JSON storage")
+	flags.Bool("disk-caching", false, "Enable disk caching with BadgerDB + JSON storage (DEPRECATED - use --db-path instead)")
+	flags.String("db-path", "", "SQLite database file path for metrics storage (default: /tmp/disk-usage.db)")
+	flags.Int("batch-size", 1000, "Batch size for SQLite operations")
 	flags.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic)")
 	flags.IntP("max-procs", "j", 4, "Maximum number of CPU cores to use for parallel processing")
 

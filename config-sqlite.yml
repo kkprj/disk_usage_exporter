@@ -1,0 +1,51 @@
+# SQLite 기반 디스크 사용량 Prometheus 익스포터 설정
+# 이 설정은 향상된 성능과 데이터 지속성을 위해 SQLite 데이터베이스를 사용합니다
+# 권장사항: SQLite 저장소는 기존 JSON 기반 캐싱 시스템을 대체합니다
+
+# 기본 설정
+analyzed-path: "/home"
+bind-address: "0.0.0.0:9995"
+dir-level: 2
+mode: "http"
+follow-symlinks: false
+
+# 로그 레벨 설정
+# 사용 가능한 레벨: trace, debug, info, warn, error, fatal, panic
+log-level: "info"
+
+# 병렬 처리를 위한 최대 CPU 코어 수
+max-procs: 8
+
+# node_disk_usage_directory_count 메트릭 수집 여부
+dir-count: true
+
+# node_disk_usage_file_count 메트릭 수집 여부
+file-count: true
+
+# node_disk_usage_size_bucket 메트릭 수집 여부
+size-bucket: true
+
+# SQLite 데이터베이스 설정
+# 고성능 처리와 데이터 지속성을 위한 SQLite 설정
+db-path: "/tmp/disk-usage.db"
+
+# SQLite 배치 처리 설정
+# 최적 성능을 위한 단일 배치에서 처리할 레코드 수
+batch-size: 1000
+
+# 백그라운드 스캔 설정 (선택사항)
+# scan-interval-minutes: 30  # 30분마다 백그라운드 스캔
+# storage-path: "/tmp/cache"  # 백그라운드 캐시 경로
+
+# 분석 시 무시할 디렉토리
+ignore-dirs:
+  - /proc
+  - /dev
+  - /sys
+  - /run
+  - /var/cache/rsnapshot
+  - /tmp
+
+# 기본 인증 설정 (선택사항)
+# basic-auth-users:
+#   admin: $2b$12$hNf2lSsxfm0.i4a.1kVpSOVyBCfIB51VRjgBUyv6kdnyTlgWj81Ay
